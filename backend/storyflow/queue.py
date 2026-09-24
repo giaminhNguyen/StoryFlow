@@ -557,6 +557,26 @@ def fail_all_agents_unavailable(db, job_id, *, now=None, error_message=None) -> 
     return _fresh_job(db, job_id)
 
 
+def cancel_pending_jobs(db, job_ids, *, now=None, error_message="workflow cancelled") -> list[str]:
+    """Cancel jobs nobody owns yet (queued / waiting_capacity). Guarded per row, so a job a
+    dispatcher claimed a moment earlier (processing) is left alone -- its late result is handled
+    by the normal owner-guarded transition and the orchestrator ignores non-ACTIVE workflows.
+    Idempotent. Returns the ids actually cancelled by this call."""
+    now = now or utcnow()
+    cancelled = []
+    with _immediate(db) as tx:
+        for job_id in job_ids:
+            cursor = tx.execute(
+                "UPDATE pipeline_jobs SET status=?, finished_at=?, outcome=?, last_error_code=?, "
+                "last_error_message=?, updated_at=? WHERE id=? AND status IN (?, ?)",
+                (JobStatus.CANCELLED.value, now, "cancelled", "cancelled", error_message, now, job_id,
+                 JobStatus.QUEUED.value, JobStatus.WAITING_CAPACITY.value),
+            )
+            if cursor.rowcount == 1:
+                cancelled.append(job_id)
+    return cancelled
+
+
 def promote_waiting_capacity(db, job_id, *, now=None) -> PipelineJob:
     """waiting_capacity -> queued so it becomes claimable again. Used by the dispatcher
     to auto-resume jobs once an eligible runner is available (pause_auto_resume)."""

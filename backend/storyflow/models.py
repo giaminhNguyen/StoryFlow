@@ -73,12 +73,21 @@ class WorkflowSession(Base):
 
 class RunnerInstance(Base):
     __tablename__ = "runner_instances"
-    __table_args__ = (Index("ix_runner_instances_workflow_session_id", "workflow_session_id"),)
+    __table_args__ = (
+        Index("ix_runner_instances_workflow_session_id", "workflow_session_id"),
+        # Phase 5 (0005): stable identity of a discovered runner across restarts.
+        Index("uq_runner_instances_external", "runner_type", "external_id", unique=True,
+              sqlite_where=text("external_id IS NOT NULL")),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     # Sessions are created in later phases; a runner may outlive/succeed a session, hence nullable.
     workflow_session_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_sessions.id"), nullable=True)
     runner_type: Mapped[str] = mapped_column(String(64))
+    # Provider-side id (e.g. a gateway runner id); NULL for hand-created rows. Discovery upserts
+    # by (runner_type, external_id) and never grants a session: workflow_session_id stays NULL
+    # until an explicit assignment command.
+    external_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     max_concurrency: Mapped[int] = mapped_column(Integer, default=1)
     active_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -179,10 +188,26 @@ class DomainStatus(str, enum.Enum):
 
 
 class ChannelWorkflowStatus(str, enum.Enum):
+    DRAFT = "draft"            # Phase 5: created, not started (needs >=1 project to start)
     ACTIVE = "active"
     PAUSED = "paused"
-    FINISHED = "finished"
-    ABANDONED = "abandoned"
+    FINISHED = "finished"      # terminal
+    CANCELLED = "cancelled"    # Phase 5 terminal; history is kept, never hard-deleted
+    ABANDONED = "abandoned"    # legacy terminal (pre-Phase 5)
+
+
+TERMINAL_WORKFLOW_STATUSES = (
+    ChannelWorkflowStatus.FINISHED.value,
+    ChannelWorkflowStatus.CANCELLED.value,
+    ChannelWorkflowStatus.ABANDONED.value,
+)
+
+
+class PauseReason(str, enum.Enum):
+    """Why a workflow is PAUSED (ChannelWorkflow.status_reason); durable, never in memory."""
+
+    OPERATOR = "operator"          # explicit pause command
+    STEP_FAILED = "step_failed"    # orchestrator paused it; status_detail names project/step/error
 
 
 class VersionStatus(str, enum.Enum):
@@ -204,7 +229,12 @@ GENERATION_LIVE_WHERE = "status IN ('queued','processing','completed')"
 
 class ChannelWorkflow(Base):
     __tablename__ = "channel_workflows"
-    __table_args__ = (Index("ix_channel_workflows_workflow_session_id", "workflow_session_id"),)
+    __table_args__ = (
+        Index("ix_channel_workflows_workflow_session_id", "workflow_session_id"),
+        # Phase 5 (0005): optional caller idempotency key, DB-enforced.
+        Index("uq_channel_workflows_client_key", "client_key", unique=True,
+              sqlite_where=text("client_key IS NOT NULL")),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     workflow_session_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_sessions.id"), nullable=True)
@@ -212,6 +242,11 @@ class ChannelWorkflow(Base):
     mode: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), default=ChannelWorkflowStatus.ACTIVE.value)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Phase 5 (0005): durable reason for PAUSED ("operator" | "step_failed"), plus detail
+    # {"project_id","step","error_code"} for step_failed. NULL in every other status.
+    status_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    client_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

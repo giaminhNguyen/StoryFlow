@@ -191,10 +191,16 @@ class Dispatcher:
             return self._no_candidate(db, session, job, now)
         runner = candidates[0]
         agent = self.registry.get(runner.id)
-        claimed = queue.claim_next_job(
-            db, runner.id, self.lease_seconds, runner=runner, role=role,
-            checkpoint_before=(job.payload_json or {}).get("checkpoint_before"), now=now,
-        )
+        try:
+            claimed = queue.claim_next_job(
+                db, runner.id, self.lease_seconds, runner=runner, role=role,
+                checkpoint_before=(job.payload_json or {}).get("checkpoint_before"), now=now,
+            )
+        except (queue.RunnerAtCapacity, queue.RunnerUnavailable):
+            # Another dispatcher process took the last slot / changed the runner's state between
+            # the candidate check and the claim. The job is untouched (still queued): not a
+            # failure of any kind, just a lost race -- the next round picks a runner again.
+            return DispatchOutcome.LOST_RACE
         if claimed is None:
             return DispatchOutcome.LOST_RACE
         attempt = queue.get_open_attempt(db, claimed.id)

@@ -1,7 +1,7 @@
 # Generated dependencies — not StoryFlow source (produced by bootstrap.py)
-external/
-skills/
-runtime/
+/external/
+/skills/
+/runtime/
 
 # Python
 __pycache__/

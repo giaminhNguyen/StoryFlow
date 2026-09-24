@@ -15,11 +15,13 @@ The project currently provides:
 
 ## Current Status
 
-**Phase 0–4 complete.**
+**Phase 0–5 complete.**
 
-**Phase 4 closure: PASS — READY FOR PHASE 5.**
+**Phase 5 closure: PASS — READY FOR PHASE 6.**
 
-Phase 5 has not started yet.
+Next: Phase 6 (local HTTP API). See `AUTONOMOUS_ROADMAP.md`.
+
+Current Status: Phase 0–5 COMPLETE · Migration head `0005_control_plane` · Backend tests `333 passed, 1 skipped` (×3) · Frontend: n/a (Phase 7).
 
 Current migration head:
 
@@ -28,9 +30,10 @@ Current migration head:
 → 0002_runner_dispatch
 → 0003_story_domain
 → 0004_pipeline_dedupe
+→ 0005_control_plane
 ```
 
-Phase 4 validation: `198 passed, 1 skipped` on three independent runs.
+Phase 5 validation: `333 passed, 1 skipped` on three independent runs (Phase 4: 198).
 
 Phase 3 closure validation:
 
@@ -666,3 +669,18 @@ ChannelWorkflow → StoryProject → source (SubtitleClient) → SourceSnapshot
 * Migration `0004_pipeline_dedupe` adds partial unique indexes on `story_generations` and `tts_generations` (one live generation per input) as the concurrency backstop.
 
 Documented external gaps: no production AI runner (AionUI has no stable task-run API, see `gateway.py`), no real TTS synthesis backend, `ExternalSubtitleClient` needs the upstream backend deps. The fakes are the executable contract. `AudioGeneration` has no `pipeline_job_id`; its job is found by dedupe key `audio:<id>`. A failed step never auto-retries: use `Orchestrator.resume` / `retry_failed_step`.
+
+
+---
+
+## Phase 5 — Control Plane & Operational Runtime
+
+Backend-only (no HTTP/UI yet). Future API/UI must go through these boundaries and never touch ORM rows or enqueue `PipelineJob`s directly.
+
+* `storyflow/services.py` — `WorkflowService` (create / add_project / start / pause / resume / retry / cancel) and `RunnerService` (assign / unassign / enable). Every status change is a guarded compare-and-set; commands are idempotent (`changed=False` no-op) and concurrency-safe. `client_key` gives DB-enforced create idempotency. Cancel is terminal: pending jobs are cancelled, open domain rows marked `cancelled`, history is kept, and a late runner result cannot resurrect the workflow. Errors are `storyflow.errors` types with stable `code`.
+* `storyflow/readmodels.py` — read-only typed snapshots (`WorkflowSnapshot`, `ProjectSnapshot`, `RunnerSnapshot`, `to_jsonable`). Current step/state is derived from the DB; relative artifact paths only; no claim tokens/paths/secrets. Business vs infrastructure vs capacity vs provider failures are separated; `chunks_missing` surfaces as `blocked`.
+* `storyflow/runtime/` — `Runtime.run_once()` / `run_forever()` (bounded work, backoff, graceful stop, per-workflow error isolation), `RunnerSupervisor` (discovery upserts runners **unassigned**; health refresh preserves quota/cooldown rules), `build_runtime()` wiring, and a stdlib CLI: `python -m storyflow.runtime --once|--run [--fake]`.
+* Migration `0005_control_plane`: `channel_workflows.status_reason/status_detail/client_key`, `runner_instances.external_id` (all additive/nullable). New workflow statuses `draft`, `cancelled`.
+* Fixes found by the two-runtime scenario: dispatcher treats a lost claim race as `LOST_RACE` (not an exception); `ArtifactStore.write` tolerates concurrent identical writers on Windows; `.gitignore` generated-dir patterns anchored to the repo root so `backend/storyflow/runtime/` is tracked.
+
+Remaining documented gaps: no production AI runner / TTS engine (Phase 8), `list_workflows` display_state is an aggregate approximation of `get_workflow`, runtime fairness counter is in-memory (ordering only, not correctness).

@@ -38,7 +38,8 @@ def test_chain_is_linear_and_0004_follows_0003():
     assert len(script.get_heads()) == 1
     rev = script.get_revision("0004_pipeline_dedupe")
     assert rev.down_revision == "0003_story_domain"
-    assert script.get_heads() == ["0004_pipeline_dedupe"]
+    assert script.get_revision("0005_control_plane").down_revision == "0004_pipeline_dedupe"
+    assert script.get_heads() == ["0005_control_plane"]
 
 
 def test_clean_upgrade_downgrade_upgrade(monkeypatch, tmp_path):

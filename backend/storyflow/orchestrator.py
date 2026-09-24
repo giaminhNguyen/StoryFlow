@@ -30,6 +30,7 @@ from .models import (
     ChannelWorkflow,
     ChannelWorkflowStatus,
     JobStatus,
+    PauseReason,
     PipelineJob,
     StoryProject,
     WorkflowSession,
@@ -129,9 +130,11 @@ class Orchestrator:
         ).all())
 
     def _set_workflow_status(self, db, workflow_id: str, new: ChannelWorkflowStatus, *, expect: ChannelWorkflowStatus,
-                             now) -> bool:
-        """Guarded transition (compare-and-set on status); returns True if this call won it."""
-        values = {"status": new.value, "updated_at": now}
+                             now, reason: PauseReason | None = None, detail: dict | None = None) -> bool:
+        """Guarded transition (compare-and-set on status); returns True if this call won it.
+        status_reason/status_detail are only meaningful while PAUSED and are cleared otherwise."""
+        values = {"status": new.value, "updated_at": now,
+                  "status_reason": reason.value if reason else None, "status_detail": detail}
         if new is ChannelWorkflowStatus.FINISHED:
             values["finished_at"] = now
         res = db.execute(update(ChannelWorkflow)
@@ -145,10 +148,15 @@ class Orchestrator:
             return None
         return db.scalar(select(PipelineJob).where(PipelineJob.id == job_id), **_FRESH)
 
-    def _schedule(self, db, handler: StepHandler, project_id: str, wf: ChannelWorkflow, now, res: TickResult):
+    def _schedule(self, db, handler: StepHandler, project_id: str, wf: ChannelWorkflow, now, res: TickResult,
+                  *, require_active: bool = True):
         """begin -> enqueue (deduped) -> link. Safe to repeat and to race.
         Returns (domain_id, job) or None when a prerequisite is missing."""
         db.expire_all()
+        # Narrow the cancel/pause race: never create new work for a workflow that stopped being
+        # ACTIVE since this tick started (a pause/cancel command is a compare-and-set on status).
+        if require_active and self._workflow(db, wf.id).status != ChannelWorkflowStatus.ACTIVE.value:
+            return None
         project = db.get(StoryProject, project_id)
         begun = handler.begin(db, self.ctx, project)
         if begun is None:
@@ -260,9 +268,13 @@ class Orchestrator:
             for pid in pids:
                 self._advance_project(db, pid, wf, now, res)
             res.projects = {pid: self._position(db, pid) for pid in pids}
-            if res.failed or any(st.status is StepStatus.FAILED for st in res.projects.values()):
-                self._set_workflow_status(db, workflow_id, ChannelWorkflowStatus.PAUSED,
-                                          expect=ChannelWorkflowStatus.ACTIVE, now=now)
+            failure = self._first_failure(res)
+            if failure is not None:
+                project_id, step, error_code = failure
+                self._set_workflow_status(
+                    db, workflow_id, ChannelWorkflowStatus.PAUSED, expect=ChannelWorkflowStatus.ACTIVE, now=now,
+                    reason=PauseReason.STEP_FAILED,
+                    detail={"project_id": project_id, "step": step, "error_code": error_code})
             elif pids and all(st.step is None for st in res.projects.values()):
                 self._set_workflow_status(db, workflow_id, ChannelWorkflowStatus.FINISHED,
                                           expect=ChannelWorkflowStatus.ACTIVE, now=now)
@@ -270,6 +282,17 @@ class Orchestrator:
             return res
         finally:
             db.close()
+
+    @staticmethod
+    def _first_failure(res: TickResult):
+        """(project_id, step, error_code) of the first failure seen this tick, else of the first
+        project whose current step is FAILED; None when nothing failed."""
+        if res.failed:
+            return res.failed[0]
+        for pid, st in res.projects.items():
+            if st.status is StepStatus.FAILED:
+                return pid, st.step, st.error_code
+        return None
 
     def _fingerprint(self, workflow_id: str, res_projects: dict[str, ProjectState] | None = None):
         db = self.ctx.session_factory()
@@ -358,7 +381,8 @@ class Orchestrator:
                 db.commit()
                 handler.run(self.ctx, project_id)
             else:
-                self._schedule(db, handler, project_id, wf, now, TickResult(workflow_status=wf.status))
+                self._schedule(db, handler, project_id, wf, now, TickResult(workflow_status=wf.status),
+                               require_active=False)
             return handler.step
         return None
 

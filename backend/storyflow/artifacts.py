@@ -8,7 +8,12 @@ and any target that would escape the store root.
 
 import os
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
+
+
+_PROMOTE_RETRIES = 8
+_PROMOTE_BACKOFF_SECONDS = 0.005
 
 
 class PathTraversalError(ValueError):
@@ -43,7 +48,7 @@ class ArtifactStore:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, dest)  # atomic promote on the same filesystem
+            self._promote(tmp, dest, data)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -51,6 +56,28 @@ class ArtifactStore:
                 pass
             raise
         return rel_path
+
+    @staticmethod
+    def _promote(tmp: str, dest: Path, data: bytes) -> None:
+        """Atomic promote (os.replace, same filesystem). On Windows a concurrent writer that is
+        replacing/reading ``dest`` makes os.replace raise PermissionError. Two writers of the
+        SAME bytes (idempotent re-runs from several processes) are harmless: if dest already
+        holds identical content we are done. Otherwise retry a bounded number of times and
+        re-raise -- a persistent conflict is never hidden."""
+        for attempt in range(_PROMOTE_RETRIES):
+            try:
+                os.replace(tmp, dest)
+                return
+            except PermissionError:
+                try:
+                    if dest.is_file() and dest.read_bytes() == data:
+                        os.unlink(tmp)
+                        return
+                except OSError:
+                    pass  # dest still busy: fall through to retry
+                if attempt == _PROMOTE_RETRIES - 1:
+                    raise
+                time.sleep(_PROMOTE_BACKOFF_SECONDS * (attempt + 1))
 
     def read(self, rel_path: str) -> bytes:
         return self.resolve(rel_path).read_bytes()
