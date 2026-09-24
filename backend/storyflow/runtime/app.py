@@ -87,7 +87,7 @@ def deterministic_fake_providers(store: ArtifactStore, *, chunking: dict | None 
 # ---------------------------------------------------------------------- schema
 
 
-def _alembic_config(database_url: str) -> Config:
+def alembic_config(database_url: str) -> Config:
     cfg = Config(str(BACKEND_DIR / "alembic.ini"))
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     cfg.set_main_option("sqlalchemy.url", database_url)
@@ -105,7 +105,7 @@ def ensure_schema(database_url: str) -> str:
     engine = make_engine(database_url)
     try:
         tables = set(inspect(engine).get_table_names())
-        head = ScriptDirectory.from_config(_alembic_config(database_url)).get_current_head()
+        head = ScriptDirectory.from_config(alembic_config(database_url)).get_current_head()
         if not tables:
             action = "created"
         elif "alembic_version" not in tables:
@@ -124,7 +124,7 @@ def ensure_schema(database_url: str) -> str:
         previous = settings.database_url
         settings.database_url = database_url
         try:
-            command.upgrade(_alembic_config(database_url), "head")
+            command.upgrade(alembic_config(database_url), "head")
         finally:
             settings.database_url = previous
     return action

@@ -1,2 +1,5 @@
 alembic==1.20.0
 SQLAlchemy==2.0.54
+# Phase 6 local HTTP API (ASGI). Pinned like the rest; loopback-only by default.
+fastapi==0.141.1
+uvicorn==0.53.0

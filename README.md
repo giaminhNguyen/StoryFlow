@@ -15,13 +15,13 @@ The project currently provides:
 
 ## Current Status
 
-**Phase 0–5 complete.**
+**Phase 0–6 complete.**
 
-**Phase 5 closure: PASS — READY FOR PHASE 6.**
+**Phase 6 closure: PASS — READY FOR PHASE 7.**
 
-Next: Phase 6 (local HTTP API). See `AUTONOMOUS_ROADMAP.md`.
+Next: Phase 7 (frontend MVP). See `AUTONOMOUS_ROADMAP.md`.
 
-Current Status: Phase 0–5 COMPLETE · Migration head `0005_control_plane` · Backend tests `333 passed, 1 skipped` (×3) · Frontend: n/a (Phase 7).
+Current Status: Phase 0–6 COMPLETE · Migration head `0005_control_plane` · Backend tests `420 passed, 3 skipped` (×3) · Frontend: n/a (Phase 7).
 
 Current migration head:
 
@@ -33,7 +33,7 @@ Current migration head:
 → 0005_control_plane
 ```
 
-Phase 5 validation: `333 passed, 1 skipped` on three independent runs (Phase 4: 198).
+Phase 6 validation: `420 passed, 3 skipped` on three independent runs (Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 
 Phase 3 closure validation:
 
@@ -684,3 +684,26 @@ Backend-only (no HTTP/UI yet). Future API/UI must go through these boundaries an
 * Fixes found by the two-runtime scenario: dispatcher treats a lost claim race as `LOST_RACE` (not an exception); `ArtifactStore.write` tolerates concurrent identical writers on Windows; `.gitignore` generated-dir patterns anchored to the repo root so `backend/storyflow/runtime/` is tracked.
 
 Remaining documented gaps: no production AI runner / TTS engine (Phase 8), `list_workflows` display_state is an aggregate approximation of `get_workflow`, runtime fairness counter is in-memory (ordering only, not correctness).
+
+
+---
+
+## Phase 6 — Local HTTP API
+
+FastAPI + Uvicorn (pinned in `backend/requirements.txt`; `httpx` in `requirements-dev.txt` for the test client). The API is a thin adapter over the Phase 5 boundary: handlers call only `WorkflowService` / `RunnerService` / `ReadModels` (no ORM, queue, dispatcher or runner access) and share **one** orchestrator with the operational runtime.
+
+```bat
+cd backend
+.venv\Scripts\python -m storyflow.api --fake            REM loopback 127.0.0.1:8765, embedded runtime, deterministic fakes
+.venv\Scripts\python -m storyflow.api --no-runtime      REM API only (run `python -m storyflow.runtime --run` separately)
+```
+
+* Default bind is `127.0.0.1`; a non-loopback host is refused (exit 2) unless `--allow-non-loopback` (logs a no-auth warning). No accounts/auth in this phase. Host-header guard (DNS-rebinding), CORS limited to `http://localhost|127.0.0.1[:port]`, `nosniff` everywhere, request bodies capped at 1 MiB (413), `/docs` disabled.
+* Endpoints (`/api`): `GET health`; `GET|POST workflows`, `GET workflows/{id}`, `POST workflows/{id}/start|pause|resume|retry|cancel`, `POST workflows/{id}/projects`, `GET projects/{id}`; `GET runners[/{id}]`, `POST runners/{id}/assign|unassign|enable|disable`; `GET|HEAD artifacts/{relative path}`.
+* Error contract: `{"error": {"code", "message", "details"}}` with codes `validation` 422, `not_found` 404, `conflict` 409, `invalid_state` 409, `not_retryable` 409, `capacity_unavailable` 503, `internal` 500 (no tracebacks/paths/input echo).
+* Idempotency is durable, never an in-memory cache: `POST /workflows` uses `client_key` / `Idempotency-Key` (DB unique index), projects use `slug`, lifecycle commands are idempotent no-ops.
+* Artifacts: only store-relative paths under `projects/`, strict segment grammar + extension allow-list, resolved through `ArtifactStore`; every refusal is the same 404 (layout cannot be probed); fixed content types, ETag/304, Range (audio), size cap.
+* Secret-looking config keys (`secret|token|password|api_key|credential`) are rejected so credentials can never be persisted through the API.
+* Module map: `storyflow/api/{app,routes,schemas,host,errors,artifacts,__main__}.py`.
+
+Remaining documented gaps: no authentication (loopback-only by design), no WebSocket (polling is enough for the MVP), real AI/TTS providers are Phase 8.

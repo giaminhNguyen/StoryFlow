@@ -1147,8 +1147,8 @@ Update this table only after a phase closure audit passes and the phase is pushe
 | 2 | COMPLETE | existing | Runner abstraction/dispatcher |
 | 3 | COMPLETE | existing | Domain + subtitle + gateway foundations |
 | 4 | COMPLETE | existing | End-to-end durable orchestration |
-| 5 | COMPLETE | see git log (`phase 5: backend control plane and runtime`) | Backend control plane/runtime; 333 passed ×3 |
-| 6 | PENDING |  | Local HTTP API |
+| 5 | COMPLETE | db31bc0 | Backend control plane/runtime; 333 passed ×3 |
+| 6 | COMPLETE | see git log (`phase 6: local api`) | Local HTTP API; 420 passed ×3 |
 | 7 | PENDING |  | Frontend MVP |
 | 8 | PENDING |  | Production integration readiness |
 | 9 | PENDING |  | Release hardening/local MVP |
