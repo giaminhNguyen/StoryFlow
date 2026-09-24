@@ -198,6 +198,8 @@ VERSION_ACTIVE_WHERE = "status = 'active'"
 CHUNK_ACTIVE_WHERE = "status = 'active'"
 ANALYSIS_ACTIVE_WHERE = "status IN ('queued','processing')"
 AUDIO_RUN_ACTIVE_WHERE = "status IN ('queued','processing')"
+# Phase 4 (0004_pipeline_dedupe): one live (queued/processing/completed) generation per input.
+GENERATION_LIVE_WHERE = "status IN ('queued','processing','completed')"
 
 
 class ChannelWorkflow(Base):
@@ -276,6 +278,8 @@ class StoryGeneration(Base):
     __table_args__ = (
         Index("ix_story_generations_story_project_id", "story_project_id"),
         Index("ix_story_generations_status", "status"),
+        Index("uq_story_generations_live_input", "story_project_id", "source_snapshot_id",
+              "canon_analysis_id", unique=True, sqlite_where=text(GENERATION_LIVE_WHERE)),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -318,7 +322,11 @@ class StoryVersion(Base):
 
 class TTSGeneration(Base):
     __tablename__ = "tts_generations"
-    __table_args__ = (Index("ix_tts_generations_story_version_id", "story_version_id"),)
+    __table_args__ = (
+        Index("ix_tts_generations_story_version_id", "story_version_id"),
+        Index("uq_tts_generations_live_input", "story_version_id", "voice", "engine",
+              unique=True, sqlite_where=text(GENERATION_LIVE_WHERE)),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     story_version_id: Mapped[str] = mapped_column(ForeignKey("story_versions.id"))

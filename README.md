@@ -15,11 +15,11 @@ The project currently provides:
 
 ## Current Status
 
-**Phase 0–3 complete.**
+**Phase 0–4 complete.**
 
-**Phase 3 closure: PASS — READY FOR PHASE 4.**
+**Phase 4 closure: PASS — READY FOR PHASE 5.**
 
-Phase 4 has not started yet.
+Phase 5 has not started yet.
 
 Current migration head:
 
@@ -27,7 +27,10 @@ Current migration head:
 0001_storyflow_initial
 → 0002_runner_dispatch
 → 0003_story_domain
+→ 0004_pipeline_dedupe
 ```
+
+Phase 4 validation: `198 passed, 1 skipped` on three independent runs.
 
 Phase 3 closure validation:
 
@@ -644,3 +647,22 @@ Phase 3  COMPLETE
 
 NEXT: Phase 4
 ```
+
+
+---
+
+## Phase 4 — End-to-End Workflow Orchestration
+
+```text
+ChannelWorkflow → StoryProject → source (SubtitleClient) → SourceSnapshot
+→ canon → CanonAnalysis → story → StoryGeneration/StoryVersion
+→ tts → TTSGeneration → audio → AudioGeneration/AudioChunk[] → workflow finished
+```
+
+* `storyflow/pipeline.py` — shared step contract (`StepHandler`, `InlineStepHandler`, `JobSpec`, `OutputValidatingRunner`).
+* `storyflow/orchestrator.py` — derives workflow position only from DB state, enqueues `PipelineJob`s (stable dedupe keys), drives the Phase 2 `Dispatcher`, finalizes finished jobs. Restart-safe; never calls runners directly.
+* `storyflow/story_steps.py`, `storyflow/tts_steps.py` — step handlers, deterministic fake runners, output validators.
+* Invalid runner output is caught inside the dispatcher path (`INVALID_OUTPUT` = business failure). Quota/rate/crash/timeout/waiting_capacity keep Phase 2 semantics.
+* Migration `0004_pipeline_dedupe` adds partial unique indexes on `story_generations` and `tts_generations` (one live generation per input) as the concurrency backstop.
+
+Documented external gaps: no production AI runner (AionUI has no stable task-run API, see `gateway.py`), no real TTS synthesis backend, `ExternalSubtitleClient` needs the upstream backend deps. The fakes are the executable contract. `AudioGeneration` has no `pipeline_job_id`; its job is found by dedupe key `audio:<id>`. A failed step never auto-retries: use `Orchestrator.resume` / `retry_failed_step`.
