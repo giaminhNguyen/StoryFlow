@@ -15,13 +15,13 @@ The project currently provides:
 
 ## Current Status
 
-**Phase 0–6 complete.**
+**Phase 0–7 complete.**
 
-**Phase 6 closure: PASS — READY FOR PHASE 7.**
+**Phase 7 closure: PASS — READY FOR PHASE 8.**
 
-Next: Phase 7 (frontend MVP). See `AUTONOMOUS_ROADMAP.md`.
+Next: Phase 8 (production integration readiness). See `AUTONOMOUS_ROADMAP.md`.
 
-Current Status: Phase 0–6 COMPLETE · Migration head `0005_control_plane` · Backend tests `420 passed, 3 skipped` (×3) · Frontend: n/a (Phase 7).
+Current Status: Phase 0–7 COMPLETE · Migration head `0005_control_plane` · Backend tests `422 passed, 3 skipped` (×3) · Frontend: typecheck clean, `105 passed` unit tests, `vite build` OK, real-backend E2E `2 passed` (×3).
 
 Current migration head:
 
@@ -33,7 +33,7 @@ Current migration head:
 → 0005_control_plane
 ```
 
-Phase 6 validation: `420 passed, 3 skipped` on three independent runs (Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
+Phase 7 validation: backend `422 passed, 3 skipped` on three independent runs (Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 
 Phase 3 closure validation:
 
@@ -707,3 +707,29 @@ cd backend
 * Module map: `storyflow/api/{app,routes,schemas,host,errors,artifacts,__main__}.py`.
 
 Remaining documented gaps: no authentication (loopback-only by design), no WebSocket (polling is enough for the MVP), real AI/TTS providers are Phase 8.
+
+
+---
+
+## Phase 7 — Frontend MVP
+
+React 19 + TypeScript + Vite + Vitest/Testing Library in `frontend/` (versions pinned exactly, `package-lock.json` committed). The UI talks **only** to the Phase 6 API (`src/api/client.ts`); it never reads SQLite or backend paths. Story text is rendered as plain text, never HTML.
+
+```bat
+REM terminal 1 - API + embedded runtime with deterministic fakes (demo video id "demo-video")
+cd backend
+.venv\Scripts\python -m storyflow.api --fake --database-url sqlite:///runtime/demo.db --artifact-root runtime/demo-artifacts
+
+REM terminal 2 - dev UI at http://127.0.0.1:5173 (Vite proxies /api to 127.0.0.1:8765; override with STORYFLOW_API_URL)
+cd frontend
+npm install
+npm run dev
+```
+
+* Screens: workflow list (state badge, `completed/total` progress, needs-attention flag, idempotent create form prefilled from `/api/health` demo), workflow detail (lifecycle controls computed by `availableActions`, invalid actions disabled with reasons, inline cancel confirmation, add project, per-project pipeline steps, failure vs capacity vs provider vs blocked panels, runner panel where detected runners stay unused until explicitly assigned), project detail (source/canon/story/TTS/audio, story viewer, per-chunk `<audio>` via safe artifact URLs).
+* All 8 states are distinguishable by text and colour: draft, active, paused, waiting capacity, failed, blocked, cancelled, completed.
+* Refresh model: bounded polling (`usePolling`): one request at a time, backoff up to 15 s while the backend is unreachable, paused while the tab is hidden, aborted on unmount; a recoverable "backend unreachable" banner keeps the last good data visible.
+* Scripts: `npm run typecheck`, `npm test` (unit, jsdom), `npm run build`, `npm run test:e2e` (spawns the real `python -m storyflow.api --fake` from the backend venv, then drives the real `<App>`: create → add project → assign runner → start → completed → story text → audio chunk `audio/wav` with RIFF header; traversal → 404).
+* Backend additions in this phase: `python -m storyflow.api --fake` wires an offline demo subtitle source and `/api/health` reports `demo.video_id`; `WorkflowSummary.completed_projects` for list progress.
+
+Remaining documented gaps: no browser-automation E2E (jsdom + real backend instead), no auth, real providers are Phase 8, the production build is not yet served by the backend (Phase 9).

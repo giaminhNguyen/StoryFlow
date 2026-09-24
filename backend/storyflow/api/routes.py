@@ -84,6 +84,7 @@ def health(request: Request):
         runtime_ok = host.running
     degraded = not (db["ok"] and db["at_head"] and runtime_ok)
     body = {"status": "degraded" if degraded else "ok", "db": db, "runtime": runtime, "runners": runners,
+            "demo": {"video_id": c.runtime_app.demo_video_id} if c.runtime_app.demo_video_id else None,
             "version": VERSION}
     return JSONResponse(body, status_code=200 if db["ok"] else 503)
 

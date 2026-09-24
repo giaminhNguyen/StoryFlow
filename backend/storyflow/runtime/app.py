@@ -77,6 +77,23 @@ class PipelineRouter(AgentRunner):
         return ResultCode.TIMEOUT if isinstance(error, TimeoutError) else ResultCode.RUNNER_CRASHED
 
 
+DEMO_VIDEO_ID = "demo-video"
+_DEMO_LINES = [
+    "The lighthouse keeper counts the ships that never return.",
+    "Every night the lamp burns a little brighter than the night before.",
+    "A stranger arrives with a map that shows the sea as it was.",
+    "She says the water remembers what the land forgets.",
+    "By morning the keeper is gone and the lamp is still lit.",
+]
+
+
+def demo_subtitle_client() -> FakeSubtitleClient:
+    """Deterministic offline transcript for ``--fake`` demos and the frontend smoke test."""
+    track = {"language": "English", "language_code": "en", "is_generated": False, "is_translatable": True,
+             "snippets": [{"text": line, "start": float(i * 3), "duration": 3.0} for i, line in enumerate(_DEMO_LINES)]}
+    return FakeSubtitleClient({DEMO_VIDEO_ID: {"tracks": [track]}})
+
+
 def deterministic_fake_providers(store: ArtifactStore, *, chunking: dict | None = None) -> list[RunnerProvider]:
     """Demo/test provider: one runner ``fake:fake-1`` serving story_writer + tts_adapter."""
     return [StaticRunnerProvider(
@@ -149,6 +166,7 @@ class RuntimeApp:
     supervisor: RunnerSupervisor
     runtime: Runtime
     providers: list[RunnerProvider] = field(default_factory=list)
+    demo_video_id: str | None = None   # set when the offline demo subtitle source is wired (--fake)
 
     def close(self) -> None:
         self.engine.dispose()
@@ -170,8 +188,12 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     store = ArtifactStore(artifact_root if artifact_root is not None else RUNTIME_DIR / "artifacts")
     clock = clock or utcnow
+    demo_video_id = None
     if subtitle_client is None:
-        subtitle_client = FakeSubtitleClient() if fake else ExternalSubtitleClient()
+        if fake:
+            subtitle_client, demo_video_id = demo_subtitle_client(), DEMO_VIDEO_ID
+        else:
+            subtitle_client = ExternalSubtitleClient()
     if providers is None:
         providers = deterministic_fake_providers(store) if fake else []
     ctx = PipelineContext(session_factory=session_factory, store=store, subtitle_client=subtitle_client, clock=clock)
@@ -182,4 +204,4 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
                                   wrap=lambda r: wrap_runner_for_pipeline(r, store))
     runtime = Runtime(ctx, orchestrator, supervisor, **runtime_kwargs)
     return RuntimeApp(engine, session_factory, store, ctx, registry, dispatcher, orchestrator,
-                      supervisor, runtime, list(providers))
+                      supervisor, runtime, list(providers), demo_video_id)

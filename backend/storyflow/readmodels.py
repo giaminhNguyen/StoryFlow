@@ -334,6 +334,9 @@ class WorkflowSummary:
     created_at: datetime | None
     updated_at: datetime | None
     finished_at: datetime | None
+    # Projects whose audio run completed (aggregate approximation of "all steps completed";
+    # exact per-step progress is in WorkflowSnapshot.counts).
+    completed_projects: int = 0
 
 
 @dataclass(frozen=True)
@@ -518,6 +521,15 @@ class ReadModels:
                 select(StoryProject.channel_workflow_id, func.count())
                 .where(StoryProject.channel_workflow_id.in_(ids))
                 .group_by(StoryProject.channel_workflow_id)).all())
+            done = dict(db.execute(
+                select(StoryProject.channel_workflow_id, func.count(distinct(StoryProject.id)))
+                .select_from(AudioGeneration)
+                .join(TTSGeneration, TTSGeneration.id == AudioGeneration.tts_generation_id)
+                .join(StoryVersion, StoryVersion.id == TTSGeneration.story_version_id)
+                .join(StoryProject, StoryProject.id == StoryVersion.story_project_id)
+                .where(AudioGeneration.status == DomainStatus.COMPLETED.value,
+                       StoryProject.channel_workflow_id.in_(ids))
+                .group_by(StoryProject.channel_workflow_id)).all())
             active = [w for w in wfs if w.status == ChannelWorkflowStatus.ACTIVE.value]
             waiting_sessions: set = set()
             chunks_missing: set = set()
@@ -548,7 +560,8 @@ class ReadModels:
                     id=w.id, name=w.name, mode=w.mode, status=w.status, status_reason=w.status_reason,
                     display_state=_display_from(w.status, w.status_reason, states),
                     project_count=counts.get(w.id, 0), session_id=w.workflow_session_id,
-                    created_at=w.created_at, updated_at=w.updated_at, finished_at=w.finished_at))
+                    created_at=w.created_at, updated_at=w.updated_at, finished_at=w.finished_at,
+                    completed_projects=done.get(w.id, 0)))
             return out
 
     def get_workflow(self, workflow_id: str) -> WorkflowSnapshot:

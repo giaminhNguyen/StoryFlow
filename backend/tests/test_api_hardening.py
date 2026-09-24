@@ -65,3 +65,20 @@ def test_normal_sized_body_still_accepted(tmp_path):
         assert resp.status_code == 201
     finally:
         rt.close()
+
+
+def test_health_reports_demo_video_only_in_fake_mode(tmp_path):
+    from storyflow.runtime import build_runtime
+
+    rt, client = _client(tmp_path)  # explicit subtitle client => no demo source advertised
+    try:
+        assert client.get("/api/health").json()["demo"] is None
+    finally:
+        rt.close()
+    fake = build_runtime(database_url=f"sqlite:///{(tmp_path / 'fake.db').as_posix()}",
+                         artifact_root=tmp_path / "fake-art", fake=True, ensure_db_schema=True)
+    try:
+        body = TestClient(create_app(fake)).get("/api/health").json()
+        assert body["demo"] == {"video_id": "demo-video"}
+    finally:
+        fake.close()

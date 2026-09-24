@@ -163,7 +163,7 @@ def test_health_degraded_503_when_db_broken(rt, client, tmp_path, monkeypatch):
     assert r.status_code == 503
     body = r.json()
     assert body["status"] == "degraded" and body["db"] == {"ok": False, "schema_revision": None, "at_head": False}
-    assert set(body) == {"status", "db", "runtime", "runners", "version"}
+    assert set(body) == {"status", "db", "runtime", "runners", "demo", "version"}
     assert "missing" not in r.text
 
 
