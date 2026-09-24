@@ -9,6 +9,21 @@ The real adapter (ExternalSubtitleClient) loads the external ``app`` package laz
 on first use: that package needs its own dependency set (requests, youtube-transcript-api,
 pydantic, ...) which is not in StoryFlow's venv, so importing this module must never
 touch external code.
+
+Capability gaps (Phase 3 audit of the upstream provider; Phase 4 work will need them):
+1. Upstream REST exposes only track metadata + job-based file download; there is no
+   HTTP endpoint that returns transcript text for a video_id. StoryFlow integrates
+   in-process via ``fetch_selected``, never through the REST layer.
+2. No "exact track for language code X" call: ``fetch_selected`` picks one track by
+   its preference order. Select a specific track via the upstream ``choose_transcript``
+   directly if ever needed.
+3. No API to read back content of an already-stored subtitle file (only ``file_path``);
+   re-reading requires the upstream ``storage.resolve_subtitle_path`` + file I/O.
+4. Upstream stores subtitle preferences per-channel only; per-video overrides cannot be
+   persisted in its DB model. Overrides must be passed as arguments per call (supported).
+5. Policy/language defaults here mirror upstream ("original", "any", translation on).
+   The real client additionally needs the upstream backend deps installed (see
+   ``import_external_subtitles``'s error message).
 """
 
 import abc

@@ -1,19 +1,28 @@
 """Gateway abstraction + FakeAionGateway tests.
 
 Covers the Phase 3 surface: detect/health, submit->poll->wait, cancel, error
-classification, and integration with StoryFlow's TaskPacket/RunnerResult/ResultCode.
+classification, the AgentRunner bridge, and integration with StoryFlow's
+TaskPacket/RunnerResult/ResultCode and the Phase 2 dispatcher/allow-list.
 Deterministic: FakeAionGateway completes tasks after a scripted poll count, no sleeps.
 """
 
+from datetime import datetime
+
 import pytest
 
+from storyflow import queue
+from storyflow.agents import RunnerRegistry
+from storyflow.dispatcher import Dispatcher, DispatchOutcome
 from storyflow.gateway import (
+    DetectedRunner,
     FakeAionGateway,
+    GatewayAgentRunner,
     GatewayError,
     TaskGateway,
     TaskHandle,
     gateway_error_code_to_result,
 )
+from storyflow.models import RunnerInstance, WorkflowSession
 from storyflow.protocol import ResultCode, RunnerHealth, RunnerResult, TaskPacket
 
 
@@ -21,16 +30,37 @@ def packet(task_id="t1", role="general_worker"):
     return TaskPacket(task_id=task_id, job_id="j1", role=role, inputs={"chapter": 1})
 
 
+BASE = datetime(2026, 1, 2, 12, 0, 0)
+
+
+def make_session(db):
+    s = WorkflowSession(mode="auto", status="active",
+                        all_agents_unavailable_policy="pause_auto_resume")
+    db.add(s)
+    db.commit()
+    return db.get(WorkflowSession, s.id)
+
+
+def add_runner(db, session, runner_type="fake", *, roles=None):
+    r = RunnerInstance(workflow_session_id=session.id, runner_type=runner_type,
+                       enabled=True, max_concurrency=2, state="ready",
+                       supported_roles=roles or ["general_worker"])
+    db.add(r)
+    db.commit()
+    return db.get(RunnerInstance, r.id)
+
+
 # --- detect / health -------------------------------------------------------
 
 
-def test_detect_lists_healthy_runners():
+def test_detect_lists_runners_with_ids_and_health():
     gw = FakeAionGateway({"alpha": True, "beta": False})
     found = gw.detect()
-    assert [h.runner_type for h in found] == ["fake", "fake"]
-    by_id = {h.state for h in found}
-    assert {"ready", "offline"} == by_id
-    assert all(isinstance(h, RunnerHealth) for h in found)
+    assert [d.runner_id for d in found] == ["alpha", "beta"]
+    assert [d.health.runner_type for d in found] == ["fake", "fake"]
+    assert {d.health.state for d in found} == {"ready", "offline"}
+    assert all(isinstance(d, DetectedRunner) for d in found)
+    assert all(isinstance(d.health, RunnerHealth) for d in found)
 
 
 def test_health_unknown_runner_is_not_ok_not_raise():
@@ -135,4 +165,61 @@ def test_gateway_speaks_phase2_types():
     result = gw.wait(gw.submit(packet()), timeout=1.0)
     assert isinstance(result, RunnerResult)
     assert isinstance(result.code, ResultCode)
-    assert all(isinstance(h, RunnerHealth) for h in gw.detect())
+    assert all(isinstance(d, DetectedRunner) for d in gw.detect())
+
+
+# --- AgentRunner bridge (Phase 2 dispatcher/allow-list integration) ---------
+
+
+def test_agent_runner_health_and_cancel_delegate_to_gateway():
+    gw = FakeAionGateway({"up": True, "down": False})
+    ar = GatewayAgentRunner(gw, runner_id="down")
+    assert ar.health().ok is False
+    assert ar.health().state == "offline"
+    # cancel only makes sense for a task the gateway is actually holding
+    handle = gw.submit(packet())
+    assert ar.cancel(handle.task_id) is True
+    assert handle.task_id in gw.cancelled
+
+
+def test_agent_runner_autopicks_first_healthy_detected():
+    assert GatewayAgentRunner(FakeAionGateway({"up": True})).runner_id == "up"
+    with pytest.raises(ValueError):
+        GatewayAgentRunner(FakeAionGateway({"down": False}))
+
+
+def test_dispatcher_routes_through_gateway_without_bypassing_allow_list(db):
+    a_session = make_session(db)
+    b_session = make_session(db)
+    ra = add_runner(db, a_session, "fake")
+    rb = add_runner(db, b_session, "fake")
+    ga = FakeAionGateway()
+    gb = FakeAionGateway()
+    reg = RunnerRegistry()
+    reg.register(ra.id, GatewayAgentRunner(ga))
+    reg.register(rb.id, GatewayAgentRunner(gb))
+    disp = Dispatcher(reg)
+
+    queue.enqueue_job(db, kind="chunk", payload={}, role="general_worker",
+                      session_id=a_session.id, now=BASE)
+    outcome, _ = disp.run_round(db, session=a_session, now=BASE)
+
+    assert outcome == DispatchOutcome.DISPATCHED_SUCCESS
+    assert len(ga.submitted) == 1
+    assert gb.submitted == [], "other-session gateway-backed runner must never be reached"
+
+
+def test_dispatcher_keeps_storyflow_role_through_gateway(db):
+    session = make_session(db)
+    r = add_runner(db, session, "fake", roles=["story_writer"])
+    gw = FakeAionGateway()
+    reg = RunnerRegistry()
+    reg.register(r.id, GatewayAgentRunner(gw))
+    disp = Dispatcher(reg)
+
+    queue.enqueue_job(db, kind="chunk", payload={}, role="story_writer",
+                      session_id=session.id, now=BASE)
+    outcome, _ = disp.run_round(db, session=session, now=BASE)
+
+    assert outcome == DispatchOutcome.DISPATCHED_SUCCESS
+    assert gw.submitted[0].role == "story_writer", "role must stay StoryFlow's, not Aion-choosen"

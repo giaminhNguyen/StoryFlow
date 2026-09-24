@@ -33,10 +33,11 @@ today is message/async through diagnostic reads, not a contractual control loop.
 Team CLI `tool_call`/messages is team-scoped collaboration, not generic task IPC.
 
 Consequence: TaskGateway is written against the *target* surface; FakeAionGateway
-implements it deterministically for tests and demos. A real `AionUiGateway` can be
-dropped in when the platform exposes the task-run triple (re-enable by wiring
-`conversation create` + a send/poll contract + cancel). The dispatcher remains
-unaware: it only sees AgentRunner/TaskPacket/RunnerResult.
+implements it deterministically for tests and demos, and GatewayAgentRunner (below)
+bridges any gateway under AgentRunner so the Phase 2 dispatcher can use it without
+change and without bypassing the session allow-list. The only remaining gap is
+external: a real `AionUiGateway` cannot be written until AionUi exposes the
+task-run triple (wire `conversation create` + a send/poll contract + cancel).
 """
 
 import abc
@@ -44,6 +45,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from .agents import AgentRunner
+from .config import settings
 from .protocol import ResultCode, RunnerHealth, RunnerResult, TaskPacket
 
 
@@ -53,6 +56,20 @@ class GatewayError(Exception):
     Raised when the gateway itself is unreachable, authentication to it fails, or a
     submitted task disappears. Callers classify it via TaskGateway.classify_error.
     """
+
+
+@dataclass(frozen=True)
+class DetectedRunner:
+    """A runner the gateway can reach: stable id + current health.
+
+    The id is what makes detect() usable to seed RunnerInstance/RunnerRegistry rows
+    scoped to a workflow session (the allow-list contract of Phase 2).
+    RunnerHealth.state mirrors RunnerState values (ready/offline/...) so the planner
+    can map to RunnerInstance.state directly.
+    """
+
+    runner_id: str
+    health: RunnerHealth
 
 
 @dataclass(frozen=True)
@@ -80,8 +97,8 @@ class TaskGateway(abc.ABC):
     poll_interval = 0.05
 
     @abc.abstractmethod
-    def detect(self) -> list[RunnerHealth]:
-        """Enumerate reachable runners and their health (for RunnerRegistry seeding)."""
+    def detect(self) -> list[DetectedRunner]:
+        """Enumerate reachable runners (id + health) for RunnerRegistry seeding."""
 
     @abc.abstractmethod
     def health(self, gateway_id: str) -> RunnerHealth:
@@ -166,8 +183,9 @@ class FakeAionGateway(TaskGateway):
         self.cancelled: list[str] = []
 
     def detect(self):
-        return [RunnerHealth(ok=ok, runner_type=self.gateway_type,
-                             state="ready" if ok else "offline")
+        return [DetectedRunner(runner_id=gi,
+                               health=RunnerHealth(ok=ok, runner_type=self.gateway_type,
+                                                   state="ready" if ok else "offline"))
                 for gi, ok in self.runners.items()]
 
     def health(self, gateway_id):
@@ -228,3 +246,41 @@ class _FakeTask:
     result: RunnerResult
     polls_left: int | None
     cancelled: bool = False
+
+
+class GatewayAgentRunner(AgentRunner):
+    """Bridge a TaskGateway under AgentRunner so the allow-list-bounded dispatcher can
+    dispatch to a gateway with zero dispatcher changes.
+
+    execute(packet) == submit + wait (gateways are async; `timeout` defaults to the
+    Phase 2 lease so a hung gateway result surfaces as ResultCode.TIMEOUT and the
+    lease/stale-recovery machinery replays the job). health()/cancel()/classify_error()
+    delegate to the gateway. Roles are strictly StoryFlow's: the packet already carries
+    the Role the dispatcher chose inside the session allow-list, and the gateway never
+    sees or assigns roles. The allow-list itself is untouched -- the dispatcher only
+    selects RunnerInstance rows of the job's session, so this runner can never receive
+    a job it wasn't actually routed.
+    """
+
+    def __init__(self, gateway: TaskGateway, *, runner_id: str | None = None,
+                 timeout: float | None = None):
+        self.gateway = gateway
+        self.runner_type = gateway.gateway_type
+        self.timeout = timeout or settings.lease_seconds
+        if runner_id is None:
+            runner_id = next((d.runner_id for d in gateway.detect() if d.health.ok), None)
+        if runner_id is None:
+            raise ValueError(f"{gateway.gateway_type} gateway has no healthy detected runner")
+        self.runner_id = runner_id
+
+    def health(self) -> RunnerHealth:
+        return self.gateway.health(self.runner_id)
+
+    def execute(self, packet: TaskPacket) -> RunnerResult:
+        return self.gateway.wait(self.gateway.submit(packet), self.timeout)
+
+    def cancel(self, task_id: str) -> bool:
+        return self.gateway.cancel(TaskHandle(task_id=task_id, gateway_id=self.runner_id))
+
+    def classify_error(self, error: BaseException) -> ResultCode:
+        return self.gateway.classify_error(error)
