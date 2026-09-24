@@ -1,0 +1,16 @@
+# Generated dependencies — not StoryFlow source (produced by bootstrap.py)
+external/
+skills/
+runtime/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

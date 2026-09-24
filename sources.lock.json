@@ -1,0 +1,36 @@
+{
+  "version": "1",
+  "subtitle_suppervip": {
+    "name": "subtitle_suppervip",
+    "repo": "https://github.com/giaminhNguyen/Subtitle_supperVip.git",
+    "revision": "cb5764898f5f951ffbdcc8e6fbf55182c7eb3646",
+    "install_to": "external/subtitle_suppervip"
+  },
+  "skills": {
+    "name": "skills-import",
+    "repo": "https://github.com/giaminhNguyen/Skills-Import.git",
+    "mirror_to": "external/_cache/skills-import",
+    "projects": {
+      "story-branch-writer": {
+        "revision": "4d4d33e62372d498a2dc85dae48368b88cb6acb4",
+        "src": "skills/opencode/story-branch-writer",
+        "install_to": "skills/story-branch-writer",
+        "required_files": [
+          "SKILL.md",
+          "scripts/init_story_project.py",
+          "references/state-schema.md"
+        ]
+      },
+      "story-tts-adapter": {
+        "revision": "8971b650a12c70481e712a18cba305a65563a2df",
+        "src": "skills/opencode/story-tts-adapter",
+        "install_to": "skills/story-tts-adapter",
+        "required_files": [
+          "SKILL.md",
+          "scripts/chunk_tts.py",
+          "references/profiles/registry.json"
+        ]
+      }
+    }
+  }
+}
