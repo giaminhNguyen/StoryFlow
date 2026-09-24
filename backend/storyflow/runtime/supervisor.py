@@ -175,6 +175,8 @@ class RunnerSupervisor:
             instance_id, created = self._upsert(provider, det, report)
             if created:
                 report.created.append(instance_id)
+                logger.info("runner_discovered runner=%s provider=%s external=%s", instance_id, provider.name,
+                            det.runner_id)
             self._register(provider, det.runner_id, instance_id, report)
         # Known rows the provider did not report this time: rebuild registry, and a successful
         # detect that omits a row means the runner is not reachable -> offline.
@@ -264,6 +266,8 @@ class RunnerSupervisor:
                     won = self._guarded(db, instance_id, state, RunnerState.OFFLINE.value, now,
                                         error_code=error_code or "unhealthy", error_message=message)
                     if won:
+                        logger.info("runner_health runner=%s change=offline error_code=%s", instance_id,
+                                    error_code or "unhealthy")
                         report.went_offline.append(instance_id)
                         return
                 self._touch(db, instance_id, now)
@@ -276,6 +280,7 @@ class RunnerSupervisor:
                 else:
                     target = RunnerState.READY.value
                 if self._guarded(db, instance_id, state, target, now, error_code=None, error_message=None):
+                    logger.info("runner_health runner=%s change=restored state=%s", instance_id, target)
                     report.restored.append(instance_id)
                     return
             self._touch(db, instance_id, now)

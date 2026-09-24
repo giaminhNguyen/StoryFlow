@@ -24,19 +24,37 @@ class ArtifactStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._root_real = self.root.resolve()  # canonical root, computed once (the directory exists)
 
     def resolve(self, rel_path: str) -> Path:
-        """Resolve a stored relative path to a real path inside the root."""
+        """Resolve a stored relative path to a path inside the root.
+
+        Textual rules reject absolute paths, ``..`` and empty segments before any filesystem access.
+        Containment is then enforced component by component: the canonical root is joined with each
+        part and only a component that really is a symlink/junction is followed (and must land inside
+        the root). We deliberately do NOT ``Path.resolve()`` the whole target: on Windows that call
+        cannot open a file/directory that another writer is creating or atomically replacing at that
+        instant and returns a different normalisation, which used to raise a spurious
+        PathTraversalError for a perfectly valid path (two runtimes writing the same artifact).
+        """
         native = Path(rel_path)
         if native.is_absolute():  # catches drive paths (C:\...) on Windows
             raise PathTraversalError(rel_path)
         rel = PurePosixPath(str(rel_path).replace("\\", "/"))
         if rel.is_absolute() or ".." in rel.parts or "" in rel.parts:
             raise PathTraversalError(rel_path)
-        target = (self.root / rel).resolve()
-        if not target.is_relative_to(self.root.resolve()):
+        root = self._root_real
+        current = root
+        for part in rel.parts:
+            current = current / part
+            if current.is_symlink() or current.is_junction():
+                real = current.resolve()
+                if not real.is_relative_to(root):
+                    raise PathTraversalError(rel_path)
+                current = real
+        if not current.is_relative_to(root):
             raise PathTraversalError(rel_path)
-        return target
+        return current
 
     def write(self, rel_path: str, data: bytes) -> str:
         """Write bytes to `rel_path`, atomically. Returns the relative path as stored."""

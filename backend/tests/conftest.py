@@ -32,3 +32,9 @@ def db(session_factory):
     session = session_factory()
     yield session
     session.close()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_log_dir(tmp_path_factory, monkeypatch):
+    """No test may write into the developer's real runtime/logs (server entry enables file logging)."""
+    monkeypatch.setenv("STORYFLOW_LOG_DIR", str(tmp_path_factory.mktemp("logs")))

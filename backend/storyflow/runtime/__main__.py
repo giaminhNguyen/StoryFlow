@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 
+from ..logging_config import configure_logging
 from .app import log_provider_readiness, SchemaError, build_runtime
 
 logger = logging.getLogger("storyflow.runtime")
@@ -27,7 +28,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--database-url", default=None)
     p.add_argument("--artifact-root", default=None)
     p.add_argument("--max-iterations", type=int, default=None)
-    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="default: $STORYFLOW_LOG_LEVEL or INFO")
+    p.add_argument("--log-dir", default=None, metavar="PATH",
+                   help="also write a rotating storyflow.log into this directory (default: console only)")
     return p
 
 
@@ -37,8 +41,18 @@ def _log_iteration(report) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        handle = configure_logging(level=args.log_level, log_dir=args.log_dir)
+    except (OSError, ValueError) as exc:
+        print(f"storyflow.runtime: cannot set up logging: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return _run(args)
+    finally:
+        handle.close()
+
+
+def _run(args) -> int:
     try:
         app = build_runtime(database_url=args.database_url, artifact_root=args.artifact_root,
                             fake=args.fake, ensure_db_schema=True)

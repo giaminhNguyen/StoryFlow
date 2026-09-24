@@ -1,27 +1,62 @@
 # StoryFlow
 
-StoryFlow is a local workflow orchestration system for building AI-assisted story production pipelines.
+StoryFlow is a local workflow orchestration system for AI-assisted story production: it fetches a source transcript,
+analyses its canon, writes a story with a local model runner and synthesises narrated audio, with durable
+(SQLite) state, restartable pipelines and a local web UI. It runs entirely on your machine, bound to loopback.
 
-The project currently provides:
+**Status: Phase 0–9 COMPLETE — StoryFlow local MVP** (details and test numbers under "Current Status" below).
 
-* durable workflow/job state backed by SQLite;
-* concurrency-safe job claiming and recovery;
-* runner abstraction and deterministic dispatch;
-* workflow/session runner allow-lists;
-* story-domain persistence and artifact versioning;
-* subtitle integration abstraction;
-* AionUI task gateway abstraction;
-* deterministic fake implementations for integration testing.
+## Quick start (Windows 11)
+
+Requirements: Python 3.11+ (tested 3.13), Node.js 20+ (tested 24), Git. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+```bat
+scripts\setup.bat        REM once (idempotent): pinned sources, backend\.venv, npm ci + build, health check
+start-app.bat            REM API + runtime + UI on http://127.0.0.1:8765 (opens the browser)
+start-app.bat --fake     REM deterministic offline demo (no model, no network)
+                         REM stop with Ctrl+C
+scripts\backup.bat       REM verified backup of database + artifacts (safe while running) -> runtime\backups\
+scripts\restore.bat --from runtime\backups\<backup-dir>      REM stop the app first; add --force to replace existing data
+```
+
+`scripts\setup.bat /check` and `start-app.bat /check` validate everything without changing anything / starting the server.
+Data lives under `runtime\` (database, artifacts, backups, logs). Migrations are applied safely at start-up
+(older database => verified backup first; newer/unknown => refused).
+
+Health and maintenance CLI: `backend\.venv\Scripts\python -m storyflow doctor|backup|restore|migrate` (`--help`; exit 0 ok / 1 problem / 2 usage or refused).
+
+### Tests and release verification
+
+```bat
+cd backend  && .venv\Scripts\python -m pytest -q                       REM backend suite
+cd frontend && npm run typecheck && npm test && npm run build         REM frontend (npm run test:e2e = real-backend E2E)
+python scripts\release_smoke.py --skip-backend-tests                   REM final regression matrix on a temporary workspace
+```
+
+### Providers
+
+Real providers are opt-in (`backend\.env`, see `backend\.env.example`); fakes are the default test path and are always labelled "Demo (fake)".
+
+| Capability | Default | Real option | Requirement |
+|---|---|---|---|
+| Subtitles | external (pinned Subtitle_supperVip subprocess) | `STORYFLOW_SUBTITLE_PROVIDER=external` | `pip install -r backend\requirements-subtitle.txt` |
+| Story / canon | none | `STORYFLOW_STORY_RUNNER=claude-cli` | `claude` CLI installed and logged in |
+| TTS | none | `STORYFLOW_TTS_ENGINE=vieneu`, `STORYFLOW_VIENEU_ROOT` | local VieNeu-TTS checkout |
+
+Security: loopback-only, **no authentication** (never expose the port); secrets are never stored or logged.
+Everything below is the per-phase engineering history and reference.
+
+---
 
 ## Current Status
 
-**Phase 0–8 complete.**
+**Phase 0–9 COMPLETE.**
 
-**Phase 8 closure: PASS — READY FOR PHASE 9.**
+**PHASE 9: PASS — STORYFLOW LOCAL MVP COMPLETE.**
 
-Next: Phase 9 (release hardening). See `AUTONOMOUS_ROADMAP.md`.
+Current Status: Phase 0–9 COMPLETE · Migration head `0005_control_plane` · Backend tests `684 passed, 6 skipped` (×3; the skips are the opt-in real smokes) · Frontend: typecheck clean, `114 passed` unit tests, `vite build` OK, real-backend E2E `2 passed` · `python scripts/release_smoke.py`: 11/11 executable steps PASS (real-provider step 12 opt-in: story + TTS PASS, real YouTube fetch skipped: provider blocks this IP).
 
-Current Status: Phase 0–8 COMPLETE · Migration head `0005_control_plane` · Backend tests `541 passed, 6 skipped` (×3; the skips are the opt-in real smokes) · Frontend: typecheck clean, `114 passed` unit tests, `vite build` OK, real-backend E2E `2 passed`.
+Supported real providers: local `claude` CLI (story/canon), local VieNeu-TTS (synthesis), pinned Subtitle_supperVip via subprocess (needs `requirements-subtitle.txt`). Known external limitations: YouTube blocks subtitle fetches from some IPs; no authentication (loopback-only by design); Ctrl+C in `start-app.bat` shows cmd's "Terminate batch job (Y/N)?" prompt.
 
 Current migration head:
 
@@ -33,7 +68,7 @@ Current migration head:
 → 0005_control_plane
 ```
 
-Phase 8 validation: backend `541 passed, 6 skipped` on three independent runs (Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
+Phase 9 validation: backend `684 passed, 6 skipped` on three independent runs (Phase 8: 541, Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 
 Phase 3 closure validation:
 
@@ -756,3 +791,18 @@ Real providers sit behind the existing abstractions (`SubtitleClient`, `AgentRun
 Verified on this machine (2026-09-25): real `claude` story smoke passed (canon 15 s + story 7 s, validators OK); real VieNeu smoke passed (2 chunks, 48 kHz mono PCM16); full HTTP flow with `claude-cli` + `vieneu` + demo subtitles completed in 77 s (164-word story, 5 audio chunks served as `audio/wav`).
 
 Known external limitations: the real YouTube subtitle fetch was **blocked by the provider from this machine's IP** (smoke skipped as "provider blocked"; wiring itself is verified against the real upstream import and a fake upstream); `claude` runs consume the operator's own Claude usage; very long sources are sent in one prompt (no chunking); TTS temperature/gap are constants; no live TTS progress channel.
+
+
+---
+
+## Phase 9 — Release Hardening & Local MVP
+
+No new product features: the system is now reproducibly installable, startable, stoppable, diagnosable and recoverable. Operator guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+* **Entry points:** `scripts\setup.bat` (idempotent setup, `/check` mode), `start-app.bat` (bootstrap pin check → venv check → `doctor --quick` → safe `migrate` → `python -m storyflow.api --open-browser`; `/check` validates without starting; Ctrl+C stops cleanly), `scriptsackup.bat`, `scripts
+estore.bat`.
+* **Serving:** the production-built frontend (`frontend/dist`) is served by the backend on `http://127.0.0.1:8765/`; `/api/*` keeps the JSON error contract; hashed assets are immutable-cached; everything is `nosniff`.
+* **Operations CLI** (`python -m storyflow`): `doctor` (prerequisites/DB/artifacts/providers/port/frontend, PASS/WARN/FAIL with fixes, `--json`), `backup` (SQLite online backup, then artifacts, manifest with sha256; never overwrites), `restore` (verifies hashes/integrity/revision, refuses in-use or non-empty targets, `--force` keeps `<target>.pre-restore-<ts>`, atomic staged swap), `migrate` (older DB ⇒ verified backup first, then upgrade; newer/unknown/foreign DBs refused; never destructive).
+* **Logging:** rotating `runtime/logs/storyflow.log`; secrets/paths redacted, messages truncated, uvicorn query strings stripped; workflow/runner/transition events logged as ids only (no story/source payloads, no switch to enable them).
+* **Fixes found by the final matrix:** `ArtifactStore.resolve` raised a spurious `PathTraversalError` on Windows when another runtime was creating/replacing the same artifact (containment is now checked component by component instead of `Path.resolve()` on the whole target; deterministic regression test added); `retry(project_id)` for an inline source failure now answers coherently (no 409 + silent reactivation); `alembic/env.py` disposes its engine.
+* **Regression matrix:** `python scripts/release_smoke.py` runs 12 steps on a clean temporary workspace (bootstrap, migration, backend tests, frontend, fake end-to-end through the real server, pause/resume/retry/cancel, restart/resume, two-runtime isolation, artifact safety, online backup + restore into a second workspace, graceful shutdown via CTRL_BREAK, opt-in real providers).

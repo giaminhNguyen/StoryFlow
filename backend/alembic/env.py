@@ -26,10 +26,13 @@ def run_migrations_offline():
 
 def run_migrations_online():
     connectable = make_engine(settings.database_url)
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-        with context.begin_transaction():
-            context.run_migrations()
+    try:
+        with connectable.connect() as connection:
+            context.configure(connection=connection, target_metadata=target_metadata)
+            with context.begin_transaction():
+                context.run_migrations()
+    finally:
+        connectable.dispose()  # release the SQLite file handle (blocks moves/deletes on Windows otherwise)
 
 
 if context.is_offline_mode():

@@ -19,7 +19,9 @@ Lifecycle (ChannelWorkflow.status)::
 ``start`` never dispatches: the runtime/orchestrator does that on its next tick.
 """
 
+import functools
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -57,6 +59,35 @@ _S = ChannelWorkflowStatus
 _VALID_POLICIES = ("pause_auto_resume", "require_attention")
 _OPEN_DOMAIN = (DomainStatus.QUEUED.value, DomainStatus.PROCESSING.value)
 _ADD_PROJECT_OK = (_S.DRAFT.value, _S.ACTIVE.value, _S.PAUSED.value)
+logger = logging.getLogger(__name__)
+
+
+def _logged_command(action: str):
+    """Decorator (logging only): one INFO ``key=value`` line per successful workflow command outcome."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(self, *args, **kwargs):
+            out = fn(self, *args, **kwargs)
+            logger.info("workflow_command workflow=%s action=%s changed=%s status=%s", out.workflow_id, action,
+                        out.changed, out.status)
+            return out
+        return inner
+    return wrap
+
+
+def _logged_runner(action: str):
+    """Decorator (logging only): one INFO line per successful runner command outcome."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(self, *args, **kwargs):
+            out = fn(self, *args, **kwargs)
+            logger.info("runner_command runner=%s action=%s changed=%s state=%s enabled=%s session=%s",
+                        out.runner_id, action, out.changed, out.state, out.enabled, out.workflow_session_id or "-")
+            return out
+        return inner
+    return wrap
+
+
 _MAX_SLUG_TRIES = 50
 _RETRY_CLAIM_TTL = timedelta(seconds=60)
 _IN_CHUNK = 400
@@ -151,6 +182,7 @@ class WorkflowService:
 
     # ------------------------------------------------------------------ create / add_project
 
+    @_logged_command("create")
     def create_workflow(self, name, mode="auto", config=None, *, all_agents_unavailable_policy="pause_auto_resume",
                         role_preferences=None, client_key=None) -> CommandResult:
         if not isinstance(name, str) or not name.strip():
@@ -227,6 +259,7 @@ class WorkflowService:
         finally:
             db.close()
 
+    @_logged_command("add_project")
     def add_project(self, workflow_id, title, *, slug=None, description=None) -> CommandResult:
         if not isinstance(title, str) or not title.strip():
             raise ValidationFailed("title is required", reason="title_required")
@@ -296,6 +329,7 @@ class WorkflowService:
 
     # ------------------------------------------------------------------ lifecycle
 
+    @_logged_command("start")
     def start(self, workflow_id) -> CommandResult:
         def decide(db, wf):
             if wf.status == _S.ACTIVE.value:
@@ -315,6 +349,7 @@ class WorkflowService:
             return None
         return self._command(workflow_id, decide)
 
+    @_logged_command("pause")
     def pause(self, workflow_id) -> CommandResult:
         def decide(db, wf):
             if wf.status == _S.PAUSED.value:
@@ -328,6 +363,7 @@ class WorkflowService:
             return None
         return self._command(workflow_id, decide)
 
+    @_logged_command("resume")
     def resume(self, workflow_id) -> CommandResult:
         def decide(db, wf):
             if wf.status == _S.ACTIVE.value:
@@ -353,7 +389,9 @@ class WorkflowService:
 
     # --- retry
 
+    @_logged_command("retry")
     def retry(self, workflow_id, *, project_id=None) -> CommandResult:
+        failed_detail_step = None
         db = self.ctx.session_factory()
         try:
             wf = self._get(db, workflow_id)
@@ -371,6 +409,14 @@ class WorkflowService:
                 if belongs is None:
                     raise NotFound("project not in workflow", reason="project_not_in_workflow",
                                    workflow_id=workflow_id, project_id=project_id)
+                # Decide retryability BEFORE claiming/mutating, so the response and the state agree.
+                # A failed inline step (source) leaves no failed domain row: the durable record is the
+                # workflow's status_detail, which names the project/step that paused the workflow.
+                named = (wf.status_detail or {}).get("project_id") == project_id
+                if not named and self.orchestrator.failed_step_of(project_id) is None:
+                    raise NotRetryable("project has no failed step", reason="project_not_failed",
+                                       workflow_id=workflow_id, project_id=project_id)
+                failed_detail_step = (wf.status_detail or {}).get("step") if named else None
         finally:
             db.close()
 
@@ -388,8 +434,9 @@ class WorkflowService:
             if project_id is not None:
                 step = self.orchestrator.retry_failed_step(project_id, now=self._now())
                 if step is None:
-                    raise NotRetryable("project has no failed step", reason="project_not_failed",
-                                       workflow_id=workflow_id, project_id=project_id)
+                    # Inline (source) failure: re-arm by reactivating; the next tick re-runs the step.
+                    self.orchestrator.resume(workflow_id, now=self._now())
+                    step = failed_detail_step
             else:
                 self.orchestrator.resume(workflow_id, now=self._now())
         finally:
@@ -444,6 +491,7 @@ class WorkflowService:
 
     # --- cancel
 
+    @_logged_command("cancel")
     def cancel(self, workflow_id) -> CommandResult:
         db = self.ctx.session_factory()
         try:
@@ -534,6 +582,7 @@ class RunnerService:
         return RunnerCommandResult(runner_id=r.id, changed=changed, workflow_session_id=r.workflow_session_id,
                                    enabled=bool(r.enabled), state=r.state, detail=detail)
 
+    @_logged_runner("assign")
     def assign_runner(self, runner_id, workflow_id=None, session_id=None, *, roles=None) -> RunnerCommandResult:
         if (workflow_id is None) == (session_id is None):
             raise ValidationFailed("give exactly one of workflow_id or session_id", reason="target_required")
@@ -586,6 +635,7 @@ class RunnerService:
         finally:
             db.close()
 
+    @_logged_runner("unassign")
     def unassign_runner(self, runner_id) -> RunnerCommandResult:
         db = self.session_factory()
         try:
@@ -607,6 +657,7 @@ class RunnerService:
         finally:
             db.close()
 
+    @_logged_runner("set_enabled")
     def set_runner_enabled(self, runner_id, enabled: bool) -> RunnerCommandResult:
         if not isinstance(enabled, bool):
             raise ValidationFailed("enabled must be a boolean", reason="invalid_enabled")

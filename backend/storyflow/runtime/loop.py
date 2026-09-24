@@ -190,6 +190,8 @@ class Runtime:
             rep = self.run_once()
             out.iterations += 1
             out.errors += len(rep.errors)
+            logger.debug("iteration n=%d workflows=%d progressed=%s errors=%d", out.iterations,
+                         len(rep.workflows), rep.progressed, len(rep.errors))
             if on_iteration is not None:
                 on_iteration(rep)
             if rep.progressed:

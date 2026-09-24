@@ -15,9 +15,13 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
 
 from ..artifacts import ArtifactStore
 from ..readmodels import ReadModels
@@ -146,23 +150,68 @@ class _NoSniff:
         await self.app(scope, receive, _send)
 
 
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"   # Vite emits content-hashed file names
+INDEX_CACHE_CONTROL = "no-cache"
+FRONTEND_BUILD_HINT = "cd frontend && npm ci && npm run build"
+
+
+class _Assets(StaticFiles):
+    """Hashed build assets: immutable cache header; any filesystem oddity (null bytes, permissions, bad
+    names) is the same 404 as a missing file, so no path detail ever leaks. Traversal is already refused
+    by StaticFiles (resolved path must stay inside the directory)."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        return resp
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except (ValueError, OSError):
+            raise StarletteHTTPException(status_code=404) from None
+
+
+def _mount_frontend(api: FastAPI, frontend_dir) -> bool:
+    """Serve ``<dir>/index.html`` at ``/`` and ``<dir>/assets`` at ``/assets``. Returns whether it is served."""
+    root = Path(frontend_dir)
+    index = root / "index.html"
+    if not index.is_file():
+        logger.warning("frontend build not found: the API works but / returns 404; build it with `%s`",
+                       FRONTEND_BUILD_HINT)
+        return False
+
+    @api.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def _index():
+        return FileResponse(index, media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": INDEX_CACHE_CONTROL})
+
+    assets = root / "assets"
+    if assets.is_dir():
+        api.mount("/assets", _Assets(directory=assets), name="assets")
+    return True
+
+
 class _StoryFlowAPI(FastAPI):
     def build_middleware_stack(self):
         return _NoSniff(super().build_middleware_stack())
 
 
-def create_app(app: RuntimeApp, *, run_runtime: bool = False, cors_origins=None, allowed_hosts=None) -> FastAPI:
+def create_app(app: RuntimeApp, *, run_runtime: bool = False, cors_origins=None, allowed_hosts=None,
+               frontend_dir=None) -> FastAPI:
     host = RuntimeHost(app) if run_runtime else None
 
     @asynccontextmanager
     async def lifespan(api: FastAPI):
         if host is not None:
             host.start()
+            logger.info("runtime host started")
         try:
             yield
         finally:
             if host is not None:
-                host.stop()
+                stopped = host.stop()
+                logger.info("runtime host stopped clean=%s", stopped)
 
     api = _StoryFlowAPI(title="StoryFlow local API", version=VERSION, lifespan=lifespan,
                         docs_url=None, redoc_url=None, openapi_url=None)
@@ -179,4 +228,5 @@ def create_app(app: RuntimeApp, *, run_runtime: bool = False, cors_origins=None,
     api.add_middleware(_HostGuard, allowed={h.lower() for h in (*DEFAULT_HOSTS, *(allowed_hosts or ()))})
     api.include_router(router, prefix="/api")
     api.include_router(artifacts.router, prefix="/api")
+    api.state.frontend_served = _mount_frontend(api, frontend_dir) if frontend_dir is not None else False
     return api

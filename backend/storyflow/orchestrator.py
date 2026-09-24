@@ -20,6 +20,7 @@ so ticking N times or from many threads/processes yields exactly one active job 
 No DB transaction is held across ``source.run`` or the dispatcher.
 """
 
+import logging
 from dataclasses import dataclass, field
 
 from sqlalchemy import select, update
@@ -36,6 +37,8 @@ from .models import (
     WorkflowSession,
 )
 from .pipeline import InlineStepHandler, PipelineContext, StepHandler, StepStatus
+
+logger = logging.getLogger(__name__)
 
 _FRESH = {"execution_options": {"populate_existing": True}}
 _MAX_STEP_PASSES = 4  # begin -> link -> finalize -> re-status; bounded so a buggy handler can't spin
@@ -141,7 +144,13 @@ class Orchestrator:
                          .where(ChannelWorkflow.id == workflow_id, ChannelWorkflow.status == expect.value)
                          .values(**values))
         db.commit()
-        return res.rowcount == 1
+        won = res.rowcount == 1
+        if won:
+            logger.info("workflow_transition workflow=%s from=%s to=%s reason=%s%s", workflow_id, expect.value,
+                        new.value, reason.value if reason else "-",
+                        "".join(f" {k}={str(v)[:80]}" for k, v in (detail or {}).items()
+                                if k in ("project_id", "step", "error_code")))
+        return won
 
     def _job(self, db, job_id: str | None) -> PipelineJob | None:
         if not job_id:
@@ -223,10 +232,13 @@ class Orchestrator:
         """Apply what the (already linked/found) job's status means for its step."""
         if job.status == JobStatus.COMPLETED.value:
             handler.finalize(db, self.ctx, domain_id, job)
+            logger.info("step_finalized project=%s step=%s job=%s", project_id, handler.step, job.id)
             res.finalized.append((project_id, handler.step))
             return _AGAIN
         if job.status in (JobStatus.FAILED.value, JobStatus.CANCELLED.value):
             handler.mark_failed(db, self.ctx, domain_id, job)
+            logger.info("step_failed project=%s step=%s job=%s error_code=%s", project_id, handler.step, job.id,
+                        str(job.last_error_code)[:80])
             res.failed.append((project_id, handler.step, job.last_error_code))
             return _FAILED
         return _WAIT  # queued / processing / waiting_capacity
@@ -385,6 +397,16 @@ class Orchestrator:
                                require_active=False)
             return handler.step
         return None
+
+    def failed_step_of(self, project_id: str) -> str | None:
+        """Read-only: the name of the project's current step if (and only if) it is FAILED. Inline-step
+        failures (source) leave no failed domain row, so they are NOT visible here (see status_detail)."""
+        db = self.ctx.session_factory()
+        try:
+            pos = self._position(db, project_id)
+            return pos.step if pos.status is StepStatus.FAILED else None
+        finally:
+            db.close()
 
     def retry_failed_step(self, project_id: str, *, now=None) -> str | None:
         """Operator action: give a project's FAILED step a fresh domain row + job, and reactivate
