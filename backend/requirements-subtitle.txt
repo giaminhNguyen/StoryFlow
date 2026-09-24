@@ -1,0 +1,15 @@
+# OPTIONAL: dependencies for the real subtitle provider (external/subtitle_suppervip), used by the
+# subtitle worker subprocess (backend/storyflow/integrations/subtitle_worker.py).
+# Versions are the exact pins from the upstream backend/requirements.txt, limited to what importing
+# app.services.subtitles needs and the StoryFlow venv does not already have (pydantic, idna, certifi,
+# typing-* are already provided by requirements.txt).
+#
+# Install into the interpreter named by STORYFLOW_SUBTITLE_PYTHON (default: the StoryFlow venv):
+#     <that python> -m pip install -r backend/requirements-subtitle.txt
+charset-normalizer==3.5.1
+defusedxml==0.7.1
+urllib3==2.8.0
+requests==2.34.2
+youtube-transcript-api==1.2.4
+python-dotenv==1.2.3
+pydantic-settings==2.15.0

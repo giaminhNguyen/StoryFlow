@@ -1,6 +1,7 @@
 import { useContext } from "react";
 import type { ApiClient } from "../api/client";
 import { CreateWorkflowForm } from "../components/CreateWorkflowForm";
+import { ProvidersPanel } from "../components/ProvidersPanel";
 import { ATTENTION_STATES, StateBadge } from "../components/StateBadge";
 import { AppContext, useReportConnection } from "../connection";
 import { formatTime } from "../format";
@@ -50,6 +51,7 @@ export function WorkflowListPage({ client }: { client: ApiClient }) {
           </tbody>
         </table>
       )}
+      <ProvidersPanel />
       <CreateWorkflowForm client={client} defaultVideoId={health?.demo?.video_id ?? null}
                           onCreated={(id) => navigate(workflowHref(id))} />
     </section>

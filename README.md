@@ -15,13 +15,13 @@ The project currently provides:
 
 ## Current Status
 
-**Phase 0–7 complete.**
+**Phase 0–8 complete.**
 
-**Phase 7 closure: PASS — READY FOR PHASE 8.**
+**Phase 8 closure: PASS — READY FOR PHASE 9.**
 
-Next: Phase 8 (production integration readiness). See `AUTONOMOUS_ROADMAP.md`.
+Next: Phase 9 (release hardening). See `AUTONOMOUS_ROADMAP.md`.
 
-Current Status: Phase 0–7 COMPLETE · Migration head `0005_control_plane` · Backend tests `422 passed, 3 skipped` (×3) · Frontend: typecheck clean, `105 passed` unit tests, `vite build` OK, real-backend E2E `2 passed` (×3).
+Current Status: Phase 0–8 COMPLETE · Migration head `0005_control_plane` · Backend tests `541 passed, 6 skipped` (×3; the skips are the opt-in real smokes) · Frontend: typecheck clean, `114 passed` unit tests, `vite build` OK, real-backend E2E `2 passed`.
 
 Current migration head:
 
@@ -33,7 +33,7 @@ Current migration head:
 → 0005_control_plane
 ```
 
-Phase 7 validation: backend `422 passed, 3 skipped` on three independent runs (Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
+Phase 8 validation: backend `541 passed, 6 skipped` on three independent runs (Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 
 Phase 3 closure validation:
 
@@ -733,3 +733,26 @@ npm run dev
 * Backend additions in this phase: `python -m storyflow.api --fake` wires an offline demo subtitle source and `/api/health` reports `demo.video_id`; `WorkflowSummary.completed_projects` for list progress.
 
 Remaining documented gaps: no browser-automation E2E (jsdom + real backend instead), no auth, real providers are Phase 8, the production build is not yet served by the backend (Phase 9).
+
+
+---
+
+## Phase 8 — Production Integration Readiness
+
+Real providers sit behind the existing abstractions (`SubtitleClient`, `AgentRunner`/`RunnerProvider`), are **opt-in** and are dispatched through the normal `Dispatcher` with the session allow-list. Deterministic fakes stay the default test path.
+
+| Capability | Real backend | Boundary | Select with |
+|---|---|---|---|
+| Subtitles | pinned `Subtitle_supperVip` public API (`available_transcripts` / `fetch_selected`) | subprocess with hard timeout (`integrations/subtitle_subprocess.py`, `subtitle_worker.py`); upstream never imported in-process, no upstream DB access, no writes into `external/` | `STORYFLOW_SUBTITLE_PROVIDER=external` (default) |
+| Story / canon | local `claude` CLI, non-interactive (`claude -p --output-format json --no-session-persistence --tools ""`), empty temp cwd, no `STORYFLOW_*` env, prompt on stdin | `integrations/claude_cli.py` (`ClaudeCliRunner`, `ClaudeCliProvider`) | `STORYFLOW_STORY_RUNNER=claude-cli` |
+| TTS synthesis | locally installed VieNeu-TTS v3 turbo (own venv) | subprocess worker (`integrations/vieneu.py`, `vieneu_worker.py`); adaptation is rule-based per the pinned profile | `STORYFLOW_TTS_ENGINE=vieneu` + `STORYFLOW_VIENEU_ROOT` |
+
+* Configuration: `storyflow/providers.py` reads `STORYFLOW_*` environment variables or a git-ignored `backend/.env` (see `backend/.env.example`, placeholders only). Story and TTS default to **none**: nothing is sent to any model and no model runs unless selected. Credentials belong to the external tools (the `claude` CLI login); StoryFlow never reads, stores or logs them.
+* Readiness: `GET /api/providers` (ready / unavailable / misconfigured / disabled / fake, path-free messages) and startup logs; the UI shows a header chip + Providers panel (fakes are labelled "Demo (fake)", never "ready").
+* Errors are classified into the Phase 2 semantics: quota / rate limit / auth / timeout / crash / transient network map to infrastructure results, invalid output to business failure; upstream network errors from the subtitle worker are transient.
+* Install the subtitle dependencies once: `pip install -r backend/requirements-subtitle.txt` (in the interpreter named by `STORYFLOW_SUBTITLE_PYTHON`, default the backend venv); until then the subtitle provider reports `unavailable` with that hint.
+* Opt-in real smoke tests (never run by the normal suite): `STORYFLOW_RUN_REAL_SMOKE=1` plus `STORYFLOW_STORY_RUNNER=claude-cli` / `STORYFLOW_TTS_ENGINE=vieneu STORYFLOW_VIENEU_ROOT=<path>` and `pytest backend/tests/smoke_real`.
+
+Verified on this machine (2026-09-25): real `claude` story smoke passed (canon 15 s + story 7 s, validators OK); real VieNeu smoke passed (2 chunks, 48 kHz mono PCM16); full HTTP flow with `claude-cli` + `vieneu` + demo subtitles completed in 77 s (164-word story, 5 audio chunks served as `audio/wav`).
+
+Known external limitations: the real YouTube subtitle fetch was **blocked by the provider from this machine's IP** (smoke skipped as "provider blocked"; wiring itself is verified against the real upstream import and a fake upstream); `claude` runs consume the operator's own Claude usage; very long sources are sent in one prompt (no chunking); TTS temperature/gap are constants; no live TTS progress channel.

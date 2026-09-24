@@ -4,6 +4,7 @@ import { ApiError } from "../api/client";
 import type { WorkflowSnapshot } from "../api/types";
 import { AddProjectForm } from "../components/AddProjectForm";
 import { ControlBar, isTerminal } from "../components/ControlBar";
+import { ProvidersPanel } from "../components/ProvidersPanel";
 import { ProjectCard } from "../components/ProjectCard";
 import { RunnerPanel } from "../components/RunnerPanel";
 import { StateBadge, describeState } from "../components/StateBadge";
@@ -84,6 +85,7 @@ export function WorkflowDetailPage({ workflowId, client }: { workflowId: string;
         </p>
         {wf.capacity.message && <p>{wf.capacity.message}</p>}
         {wf.capacity.unserved_roles.length > 0 && <p>Unserved roles: {wf.capacity.unserved_roles.join(", ")}</p>}
+        {wf.capacity.unserved_roles.length > 0 && <ProvidersPanel />}
       </section>
     </section>
   );

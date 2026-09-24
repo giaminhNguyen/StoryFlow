@@ -13,7 +13,7 @@ import signal
 import sys
 import threading
 
-from .app import SchemaError, build_runtime
+from .app import log_provider_readiness, SchemaError, build_runtime
 
 logger = logging.getLogger("storyflow.runtime")
 
@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         app = build_runtime(database_url=args.database_url, artifact_root=args.artifact_root,
                             fake=args.fake, ensure_db_schema=True)
+        log_provider_readiness(app)
     except SchemaError as exc:
         print(f"storyflow.runtime: startup failed: {exc}", file=sys.stderr)
         return 2

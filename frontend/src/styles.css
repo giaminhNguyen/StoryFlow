@@ -42,3 +42,6 @@ button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
 .problem-business, .problem-infrastructure, .problem-provider, .problem-unknown { border-color: var(--bad); background: #fff5f5; }
 .problem p { margin: 4px 0; }
 progress { vertical-align: middle; }
+
+.plain-list { list-style: none; padding: 0; margin: 0; }
+.provider-row { padding: 4px 0; }

@@ -72,6 +72,15 @@ class BlockedByProvider(Exception):
     """The provider refused the request (IP blocked / rate limited / 429)."""
 
 
+class ProviderUnavailable(Exception):
+    """Provider not installed/misconfigured (worker python, deps or upstream dir missing).
+    Permanent until an operator fixes the configuration."""
+
+
+class ProviderTimeout(Exception):
+    """The provider call hit the hard timeout (transient)."""
+
+
 def plain_text(subtitle: FetchedSubtitle) -> str:
     """Transcript rendered as plain text lines, mirroring the provider's txt serialization."""
     return "\n".join(snippet.text for snippet in subtitle.snippets)

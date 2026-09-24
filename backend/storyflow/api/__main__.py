@@ -12,7 +12,7 @@ import ipaddress
 import logging
 import sys
 
-from ..runtime.app import SchemaError, build_runtime
+from ..runtime.app import log_provider_readiness, SchemaError, build_runtime
 from .app import create_app
 
 logger = logging.getLogger("storyflow.api")
@@ -45,6 +45,7 @@ def build_server_app(args: argparse.Namespace):
     """Testable seam: returns (fastapi_app, runtime_app). Caller closes runtime_app."""
     runtime_app = build_runtime(database_url=args.database_url, artifact_root=args.artifact_root,
                                 fake=args.fake, ensure_db_schema=True)
+    log_provider_readiness(runtime_app)
     extra_hosts = [] if is_loopback_host(args.host) else [args.host]
     return create_app(runtime_app, run_runtime=not args.no_runtime, allowed_hosts=extra_hosts), runtime_app
 

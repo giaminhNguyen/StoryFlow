@@ -78,6 +78,8 @@ from .subtitles import (
     PROJECT_ROOT,
     BlockedByProvider,
     LanguageUnavailable,
+    ProviderTimeout,
+    ProviderUnavailable,
     SubtitlesUnavailable,
     plain_text,
 )
@@ -240,6 +242,9 @@ class SourceStep(InlineStepHandler):
       BlockedByProvider    -> NOT_STARTED error_code "provider_blocked"   (transient: nothing
                               was persisted, so no domain row exists; the next tick retries.
                               Not FAILED, because a block is not a business failure.)
+      ProviderTimeout      -> NOT_STARTED error_code "provider_timeout"   (transient, like a block)
+      ProviderUnavailable  -> FAILED   error_code "provider_unavailable"  (operator must fix
+                              the provider install/config; resume/retry re-runs the step)
     Snapshots are immutable: an existing active snapshot is returned as-is, never replaced.
     """
 
@@ -273,8 +278,11 @@ class SourceStep(InlineStepHandler):
             return StepView(StepStatus.FAILED, error_code="subtitles_unavailable")
         except LanguageUnavailable:
             return StepView(StepStatus.FAILED, error_code="language_unavailable")
-        except BlockedByProvider:
-            return StepView(StepStatus.NOT_STARTED, error_code="provider_blocked")
+        except (BlockedByProvider, ProviderTimeout) as exc:
+            code = "provider_timeout" if isinstance(exc, ProviderTimeout) else "provider_blocked"
+            return StepView(StepStatus.NOT_STARTED, error_code=code)
+        except ProviderUnavailable:
+            return StepView(StepStatus.FAILED, error_code="provider_unavailable")
 
         content = plain_text(fetched)
         if not content.strip():

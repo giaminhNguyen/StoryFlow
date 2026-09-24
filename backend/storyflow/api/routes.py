@@ -89,6 +89,26 @@ def health(request: Request):
     return JSONResponse(body, status_code=200 if db["ok"] else 503)
 
 
+# ---------------------------------------------------------------------------- providers
+
+
+@router.get("/providers")
+def providers(request: Request):
+    """Readiness of the real integrations (subtitle / story runner / TTS engine): state + short
+    path-free message only. ``configured`` is false when the app was assembled with injected
+    providers (no ProviderConfig), e.g. in tests."""
+    from ..readmodels import scrub_text
+
+    stack = _c(request).runtime_app.provider_stack
+    if stack is None:
+        return {"configured": False, "ready": None, "providers": []}
+    items = []
+    for st in stack.statuses():
+        items.append({"name": st.name, "kind": st.kind, "state": st.state, "usable": st.usable,
+                      "message": scrub_text(st.message), "details": to_jsonable(st.details)})
+    return {"configured": True, "ready": stack.ready, "providers": items}
+
+
 # ---------------------------------------------------------------------------- workflows
 
 

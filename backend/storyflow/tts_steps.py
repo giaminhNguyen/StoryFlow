@@ -44,9 +44,11 @@ ArtifactStore.write (temp + fsync + atomic promote); completed output is never o
 """
 
 import hashlib
+import io
 import json
 import re
 import struct
+import wave
 from collections import deque
 from functools import lru_cache
 
@@ -153,16 +155,22 @@ def fake_wav(text: str) -> bytes:
 
 
 def wav_duration_ms(data: bytes) -> int | None:
-    """Duration of a fake/PCM wav, or None if the bytes are not a well-formed non-empty wav."""
-    if len(data) <= _WAV_HEADER or data[:4] != b"RIFF" or data[8:12] != b"WAVE" or data[12:16] != b"fmt ":
+    """Duration of a well-formed, non-empty, complete mono PCM wav (8/16-bit, any sample rate: the
+    deterministic fake writes 8 kHz/8-bit, real engines such as VieNeu write 48 kHz/16-bit), else None
+    for anything malformed, empty, truncated, multi-channel or non-PCM."""
+    if len(data) < _WAV_HEADER or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         return None
-    fmt, channels, rate, _byte_rate, _align, bits = struct.unpack("<HHIIHH", data[20:36])
-    if fmt != 1 or channels != 1 or bits != 8 or rate != WAV_RATE or data[36:40] != b"data":
+    try:
+        with wave.open(io.BytesIO(data), "rb") as w:
+            frames, rate, width = w.getnframes(), w.getframerate(), w.getsampwidth()
+            if (frames <= 0 or rate <= 0 or w.getnchannels() != 1 or width not in (1, 2)
+                    or w.getcomptype() != "NONE"):
+                return None
+            if len(data) < _WAV_HEADER + frames * width:
+                return None
+            return frames * 1000 // rate
+    except (EOFError, wave.Error):
         return None
-    (size,) = struct.unpack("<I", data[40:44])
-    if size == 0 or size != len(data) - _WAV_HEADER:
-        return None
-    return size * 1000 // WAV_RATE
 
 
 def _valid_audio(store: ArtifactStore, path: str) -> int | None:

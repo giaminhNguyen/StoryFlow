@@ -10,6 +10,7 @@ export function makeFakeClient(over: Record<string, unknown> = {}): FakeClient {
   const runnerResult = { runner_id: "r1", changed: true, workflow_session_id: null, enabled: true, state: "ready", detail: {} };
   const fake = {
     health: vi.fn().mockResolvedValue(makeHealth()),
+    providers: vi.fn().mockResolvedValue({ configured: false, ready: null, providers: [] }),
     listWorkflows: vi.fn().mockResolvedValue([makeSummary()]),
     getWorkflow: vi.fn().mockResolvedValue(wf),
     createWorkflow: vi.fn().mockResolvedValue({ result, workflow: wf }),

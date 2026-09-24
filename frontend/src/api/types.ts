@@ -107,3 +107,17 @@ export interface CreateWorkflowInput {
 export type ErrorCode =
   | "validation" | "not_found" | "conflict" | "invalid_state" | "not_retryable" | "capacity_unavailable"
   | "internal";
+
+export type ProviderKind = "subtitle" | "story" | "tts";
+export type ProviderState = "ready" | "unavailable" | "misconfigured" | "disabled" | "fake";
+export interface ProviderStatus {
+  name: string; kind: ProviderKind; state: ProviderState; usable: boolean; message: string;
+  details: Record<string, unknown>;
+}
+export interface ProvidersInfo {
+  /** False when the app was assembled with injected providers (no provider configuration). */
+  configured: boolean;
+  /** True when subtitle + story + tts are all usable right now (fakes count as usable, see state). */
+  ready: boolean | null;
+  providers: ProviderStatus[];
+}

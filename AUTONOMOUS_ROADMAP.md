@@ -1149,8 +1149,8 @@ Update this table only after a phase closure audit passes and the phase is pushe
 | 4 | COMPLETE | existing | End-to-end durable orchestration |
 | 5 | COMPLETE | db31bc0 | Backend control plane/runtime; 333 passed ×3 |
 | 6 | COMPLETE | ed02b93 | Local HTTP API; 420 passed ×3 |
-| 7 | COMPLETE | see git log (`phase 7: frontend mvp`) | Frontend MVP; 105 unit + 2 e2e; backend 422 ×3 |
-| 8 | PENDING |  | Production integration readiness |
+| 7 | COMPLETE | 146d785 | Frontend MVP; 105 unit + 2 e2e; backend 422 ×3 |
+| 8 | COMPLETE | see git log (`phase 8: production integrations`) | claude-cli story runner + VieNeu TTS + subprocess subtitles; real story/TTS smokes passed; YouTube fetch IP-blocked (documented); backend 541 ×3 |
 | 9 | PENDING |  | Release hardening/local MVP |
 
 ---

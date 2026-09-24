@@ -1,6 +1,6 @@
 // Typed client for the local StoryFlow API. The frontend talks to nothing else: no SQLite, no filesystem.
 import type {
-  CommandResult, CreateWorkflowInput, ErrorCode, Health, ProjectSnapshot, RunnerCommandResult, RunnerSnapshot,
+  CommandResult, CreateWorkflowInput, ErrorCode, Health, ProjectSnapshot, ProvidersInfo, RunnerCommandResult, RunnerSnapshot,
   WorkflowSnapshot, WorkflowSummary,
 } from "./types";
 
@@ -78,6 +78,10 @@ export class ApiClient {
       throw new BackendUnavailableError(`Unexpected health response (${response.status})`);
     }
     return payload;
+  }
+
+  providers(signal?: AbortSignal): Promise<ProvidersInfo> {
+    return this.request("GET", "/providers", undefined, signal);
   }
 
   listWorkflows(signal?: AbortSignal): Promise<WorkflowSummary[]> {

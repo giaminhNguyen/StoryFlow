@@ -121,6 +121,11 @@ def _bound(text: str | None, limit: int = MESSAGE_LIMIT) -> str | None:
     return text[:limit]
 
 
+def scrub_text(text: str | None, limit: int = MESSAGE_LIMIT) -> str:
+    """Public alias of the message sanitiser (bounded, absolute paths replaced by ``<path>``)."""
+    return _bound(text, limit) or ""
+
+
 def _rel(path) -> str | None:
     """Return ``path`` only if it is a safe relative store path, else None."""
     if not isinstance(path, str) or not path:

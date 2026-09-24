@@ -17,3 +17,7 @@ Desktop.ini
 # Frontend build artifacts
 /frontend/node_modules/
 /frontend/dist/
+
+# Local provider configuration (never commit)
+.env
+*.env.local

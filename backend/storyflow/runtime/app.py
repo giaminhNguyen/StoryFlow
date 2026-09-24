@@ -12,6 +12,7 @@ artifacts become INVALID_OUTPUT inside the dispatcher path (business retry seman
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,7 +37,7 @@ from ..pipeline import OutputValidatingRunner, PipelineContext
 from ..protocol import ResultCode
 from ..roles import Role
 from ..story_steps import STORY_VALIDATORS, CanonStep, FakeStoryPipelineRunner, SourceStep, StoryStep
-from ..subtitles import ExternalSubtitleClient, FakeSubtitleClient, SubtitleClient
+from ..subtitles import FakeSubtitleClient, SubtitleClient
 from ..tts_steps import TTS_VALIDATORS, AudioStep, FakeAudioRunner, FakeTTSAdapterRunner, TTSStep
 from .loop import Runtime
 from .supervisor import RunnerProvider, RunnerSupervisor, StaticRunnerProvider
@@ -167,16 +168,35 @@ class RuntimeApp:
     runtime: Runtime
     providers: list[RunnerProvider] = field(default_factory=list)
     demo_video_id: str | None = None   # set when the offline demo subtitle source is wired (--fake)
+    provider_stack: object | None = None  # storyflow.providers.ProviderStack (readiness via .statuses())
 
     def close(self) -> None:
         self.engine.dispose()
+
+
+def log_provider_readiness(app: "RuntimeApp") -> None:
+    """One INFO line per provider at startup (state + short message; never paths/secrets)."""
+    stack = app.provider_stack
+    if stack is None:
+        return
+    for st in stack.statuses():
+        logging.getLogger("storyflow.providers").info("provider %s/%s: %s %s", st.kind, st.name, st.state, st.message)
+
+
+def _fake_stack(subtitle_client, providers):
+    from ..providers import FAKE, ProviderConfig, ProviderStack, ProviderStatus
+
+    statuses = [ProviderStatus("fake", kind, FAKE, f"deterministic fake {kind} (offline demo)")
+                for kind in ("subtitle", "story", "tts")]
+    return ProviderStack(ProviderConfig(subtitle_provider="fake", story_runner="fake", tts_engine="fake"),
+                         subtitle_client, list(providers), [(lambda s=s: s) for s in statuses])
 
 
 def build_runtime(*, database_url: str | None = None, artifact_root=None,
                   providers: list[RunnerProvider] | None = None,
                   subtitle_client: SubtitleClient | None = None,
                   clock: Callable[[], datetime] | None = None,
-                  fake: bool = False, ensure_db_schema: bool = False,
+                  fake: bool = False, ensure_db_schema: bool = False, provider_config=None,
                   **runtime_kwargs) -> RuntimeApp:
     """Wire one process. ``fake=True`` -> FakeSubtitleClient + deterministic fake providers
     (unless explicit ones are passed). ``ensure_db_schema`` runs :func:`ensure_schema` first.
@@ -189,13 +209,22 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
     store = ArtifactStore(artifact_root if artifact_root is not None else RUNTIME_DIR / "artifacts")
     clock = clock or utcnow
     demo_video_id = None
-    if subtitle_client is None:
-        if fake:
+    stack = None
+    if fake:
+        if subtitle_client is None:
             subtitle_client, demo_video_id = demo_subtitle_client(), DEMO_VIDEO_ID
-        else:
-            subtitle_client = ExternalSubtitleClient()
-    if providers is None:
-        providers = deterministic_fake_providers(store) if fake else []
+        if providers is None:
+            providers = deterministic_fake_providers(store)
+        stack = _fake_stack(subtitle_client, providers)
+    elif subtitle_client is None or providers is None:
+        # Real (or disabled) providers selected explicitly through environment / local .env.
+        from ..providers import build_provider_stack, load_provider_config
+
+        stack = build_provider_stack(provider_config or load_provider_config(), store)
+        if subtitle_client is None:
+            subtitle_client = stack.subtitle_client
+        if providers is None:
+            providers = stack.runner_providers
     ctx = PipelineContext(session_factory=session_factory, store=store, subtitle_client=subtitle_client, clock=clock)
     registry = RunnerRegistry()
     dispatcher = Dispatcher(registry)
@@ -204,4 +233,4 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
                                   wrap=lambda r: wrap_runner_for_pipeline(r, store))
     runtime = Runtime(ctx, orchestrator, supervisor, **runtime_kwargs)
     return RuntimeApp(engine, session_factory, store, ctx, registry, dispatcher, orchestrator,
-                      supervisor, runtime, list(providers), demo_video_id)
+                      supervisor, runtime, list(providers), demo_video_id, stack)

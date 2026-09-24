@@ -1,18 +1,19 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from "react";
-import type { Health } from "./api/types";
+import type { Health, ProvidersInfo } from "./api/types";
 
 interface AppContextValue {
   health: Health | null;
+  providers?: ProvidersInfo | null;
   /** Report whether a polling source can reach the backend; key identifies the source. */
   report: (key: string, connected: boolean) => void;
   /** Remove a source (on unmount). */
   forget: (key: string) => void;
 }
 
-export const AppContext = createContext<AppContextValue>({ health: null, report: () => {}, forget: () => {} });
+export const AppContext = createContext<AppContextValue>({ health: null, providers: null, report: () => {}, forget: () => {} });
 
-export function AppProvider({ health, onDisconnectedChange, children }: {
-  health: Health | null; onDisconnectedChange: (disconnected: boolean) => void; children: ReactNode;
+export function AppProvider({ health, providers = null, onDisconnectedChange, children }: {
+  health: Health | null; providers?: ProvidersInfo | null; onDisconnectedChange: (disconnected: boolean) => void; children: ReactNode;
 }) {
   const [down, setDown] = useState<Record<string, boolean>>({});
   const report = useCallback((key: string, connected: boolean) => {
@@ -28,7 +29,7 @@ export function AppProvider({ health, onDisconnectedChange, children }: {
   }, []);
   const anyDown = Object.values(down).some(Boolean);
   useEffect(() => onDisconnectedChange(anyDown), [anyDown, onDisconnectedChange]);
-  const value = useMemo(() => ({ health, report, forget }), [health, report, forget]);
+  const value = useMemo(() => ({ health, providers, report, forget }), [health, providers, report, forget]);
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 
