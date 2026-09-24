@@ -3,4 +3,4 @@
 Subtitle_supperVip is a pattern reference only; all code here is StoryFlow's own.
 """
 
-__all__ = ["models", "database", "config", "queue", "runners"]
+__all__ = ["models", "database", "config", "queue", "runners", "subtitles"]

@@ -34,11 +34,19 @@ def migrated_db(monkeypatch, tmp_path):
 def test_fresh_migration_succeeds(migrated_db, tmp_path):
     insp = inspect(migrated_db)
     names = set(insp.get_table_names())
-    assert {"workflow_sessions", "runner_instances", "pipeline_jobs", "runner_attempts"} <= names
+    assert {"workflow_sessions", "runner_instances", "pipeline_jobs", "runner_attempts",
+            "channel_workflows", "story_projects", "source_snapshots", "canon_analyses",
+            "story_generations", "story_versions", "tts_generations", "audio_generations",
+            "audio_chunks"} <= names
 
     dedupe_index = next(i for i in insp.get_indexes("pipeline_jobs") if i["name"] == "ix_pipeline_jobs_active_dedupe")
     assert bool(dedupe_index["unique"]) is True
     assert "dedupe_key" in dedupe_index["column_names"]
+
+    version_index = next(i for i in insp.get_indexes("story_versions")
+                         if i["name"] == "uq_story_versions_active_number")
+    assert bool(version_index["unique"]) is True
+    assert version_index["column_names"] == ["story_project_id", "version_number"]
 
     Session = sessionmaker(bind=migrated_db, expire_on_commit=False)
     with Session() as db:
