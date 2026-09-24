@@ -11,6 +11,7 @@ from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Stri
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
+from .roles import DEFAULT_ROLE, DEFAULT_SUPPORTED_ROLES
 
 
 def uid() -> str:
@@ -62,7 +63,9 @@ class WorkflowSession(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     mode: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default=SessionStatus.ACTIVE.value)
-    all_agents_unavailable_policy: Mapped[str] = mapped_column(String(32), default="requeue")
+    all_agents_unavailable_policy: Mapped[str] = mapped_column(String(32), default="pause_auto_resume")
+    # Optional ordered runner_type preference per role: {role: [runner_type, ...]}.
+    role_preferences: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -80,10 +83,13 @@ class RunnerInstance(Base):
     max_concurrency: Mapped[int] = mapped_column(Integer, default=1)
     active_count: Mapped[int] = mapped_column(Integer, default=0)
     state: Mapped[str] = mapped_column(String(32), default=RunnerState.READY.value)
+    # Roles this runner can serve (role = work type, runner_type = process kind).
+    supported_roles: Mapped[list] = mapped_column(JSON, default=list(DEFAULT_SUPPORTED_ROLES))
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     quota_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_health_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -94,6 +100,7 @@ class PipelineJob(Base):
     __table_args__ = (
         Index("ix_pipeline_jobs_claim", "status", "priority", "scheduled_at", "created_at"),
         Index("ix_pipeline_jobs_status_lease", "status", "lease_expires_at"),
+        Index("ix_pipeline_jobs_workflow_session_id", "workflow_session_id"),
         Index(
             "ix_pipeline_jobs_active_dedupe",
             "dedupe_key",
@@ -108,8 +115,19 @@ class PipelineJob(Base):
     payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     channel_fairness_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    role: Mapped[str] = mapped_column(String(64), default=DEFAULT_ROLE)
+    # The job's allow-list: only runners of this session may touch it.
+    workflow_session_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_sessions.id"), nullable=True)
+    # Number of real dispatches (infra + business combined); purely observational.
+    execution_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Business attempt counter: incremented ONLY on business failures (task_failed,
+    # invalid_output). -- NOT on quota/rate-limit/unavailability/waiting.
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    # Infrastructure failures (crash/timeout/stale lease). Guards against crash
+    # feedback loops without touching the business `attempts` counter.
+    infrastructure_failures: Mapped[int] = mapped_column(Integer, default=0)
+    max_infra_attempts: Mapped[int] = mapped_column(Integer, default=5)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)

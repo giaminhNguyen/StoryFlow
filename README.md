@@ -2,6 +2,9 @@
 
 Phase 1: minimal backend — SQLite schema (via Alembic) and a concurrency-safe job
 queue (atomic claim, worker ownership/lease, active-job dedupe, stale recovery).
+Phase 2: runner abstraction — AgentRunner/TaskPacket/RunnerResult protocols,
+session allow-list dispatcher, deterministic selection, quota/rate-limit failover,
+and explicit capacity/attempt lifecycle semantics.
 Phase 0 (bootstrap) remains intact.
 
 ## Backend
@@ -10,11 +13,15 @@ Phase 0 (bootstrap) remains intact.
 backend/
   storyflow/database.py     engine/session + pragmas (WAL, busy_timeout, FK) + sqlite3 datetime adapter
   storyflow/models.py       WorkflowSession, RunnerInstance, PipelineJob, RunnerAttempt (+ enums, indexes)
-  storyflow/queue.py        enqueue/claim/renew/complete/fail/requeue/waiting_capacity/recover
+  storyflow/queue.py        enqueue/claim/renew/complete/fail/business+infra counter helpers/recover
+  storyflow/roles.py        Role enum (story_writer/tts_adapter/reviewer/general_worker)
+  storyflow/protocol.py     TaskPacket, RunnerResult, ResultCode, RunnerHealth
+  storyflow/agents.py       AgentRunner ABC, RunnerRegistry, FakeRunner (test-only)
+  storyflow/dispatcher.py   allow-list candidate ranking, dispatch, failover, resume, park/fail
   storyflow/runners.py      runner state helpers
-  storyflow/config.py       Settings (db url, lease/timeout/attempts defaults)
-  alembic/                  migrations, revision 0001_storyflow_initial
-  tests/                    22 pytest tests (deterministic time, real thread race)
+  storyflow/config.py       Settings (db url, lease/timeout/attempts/infra/cooldown defaults)
+  alembic/                  migrations: 0001_storyflow_initial, 0002_runner_dispatch
+  tests/                    48 pytest tests (deterministic time, real thread race)
   .venv/                    python 3.13 + SQLAlchemy 2.0.54 + Alembic 1.20.0 + pytest
 ```
 
@@ -24,6 +31,33 @@ only by the exact `(worker_id, claim_token)` that claimed them; a partial unique
 index keeps one active job per `dedupe_key`; stale recovery touches only processing
 jobs whose lease actually expired. `waiting_capacity` is not a business failure
 (attempts/outcome untouched).
+
+### Phase 2 semantics
+
+- **Capacity** is DB-derived: claiming a job with a runner creates an OPEN
+  `RunnerAttempt` (`result_type IS NULL`) and bumps `runner.active_count`. The ONLY
+  decrement is idempotently closing that attempt (`UPDATE ... WHERE result_type IS NULL`)
+  inside the same `BEGIN IMMEDIATE` txn, plus `MAX(0, active_count-1)` as belt — at
+  most one slot per attempt, active_count can never go negative.
+- **Counters**: `PipelineJob.attempts` counts BUSINESS failures only
+  (`task_failed`, `invalid_output`). `execution_count` counts every dispatch
+  (observational). `infrastructure_failures`/`max_infra_attempts` cap crash/timeout/
+  transient/lease-expiry loops. Quota/rate-limit/auth add NO counters.
+- **Quota** is not a failure: the runner goes `quota_exhausted` with `quota_reset_at`,
+  its slot is freed, the job is requeued immediately, and `run_round` keeps failing over
+  through the same allow-list filter (bounded by `max_failover_passes`). Rate limit
+  works the same with `cooldown_until`/`retry_after`.
+- **Allow-list**: the dispatcher only reaches runners whose `workflow_session_id` is the
+  job's session. Candidate = session runners ∩ role-compatible (`supported_roles`) ∩
+  enabled ∩ registered ∩ state-now-eligible ∩ below `max_concurrency`. Ranking is
+  deterministic: role preference → normalized load → LRU → type/id.
+- **No eligible runner**: `pause_auto_resume` parks the job as `waiting_capacity`
+  (resumed when a candidate exists; event-driven, no busy loop); `require_attention`
+  fails the job with `ALL_AGENTS_UNAVAILABLE`.
+- **Runners**: `AgentRunner` ABC (`health/execute/cancel/classify_error`), no Claude/
+  Codex/OpenCode logic; roles are independent of runner kinds. `FakeRunner` simulates
+  success/quota/rate/crash/timeout/invalid deterministically for tests. `TaskPacket`
+  carries no DB credentials, claim tokens, or SQLite state.
 
 ```bat
 cd backend

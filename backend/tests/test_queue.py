@@ -1,7 +1,8 @@
 """Queue service tests: lifecycle, dedupe, atomic claim, ownership, leases, stale recovery.
 
-All timing is deterministic: `now` is injected, not slept on. Concurrency is synchronized
-with a threading.Barrier.
+Phase 2 semantics: PipelineJob.attempts counts business failures only;
+execution_count counts dispatches; capacity is tied to open RunnerAttempt close.
+Deterministic: `now` is injected, concurrency uses a threading.Barrier.
 """
 
 import threading
@@ -27,7 +28,7 @@ def at(seconds: int) -> datetime:
 
 
 def add_job(db, kind="test", **kw):
-    defaults = dict(scheduled_at=BASE, priority=0, max_attempts=5)
+    defaults = dict(scheduled_at=BASE, priority=0, max_attempts=5, max_infra_attempts=5)
     defaults.update(kw)
     job = PipelineJob(kind=kind, **defaults)
     db.add(job)
@@ -71,7 +72,10 @@ def test_enqueue_job_and_defaults(db):
                             priority=5, channel_fairness_key="chan-a", now=BASE)
     assert job.status == "queued"
     assert job.attempts == 0
+    assert job.execution_count == 0
+    assert job.infrastructure_failures == 0
     assert job.max_attempts == 5
+    assert job.role == "general_worker"
     assert job.payload_json == {"chapter": 1}
     assert job.worker_id is None and job.claim_token is None and job.lease_expires_at is None
     assert job.scheduled_at == BASE
@@ -150,7 +154,8 @@ def test_two_workers_cannot_both_claim_same_job(session_factory, engine):
     row = reload(s, job_id)
     assert row.status == "processing"
     assert row.worker_id in winners
-    assert row.attempts == 1
+    assert row.execution_count == 1
+    assert row.attempts == 0
     s.close()
 
 
@@ -160,7 +165,8 @@ def test_two_workers_cannot_both_claim_same_job(session_factory, engine):
 def test_exact_owner_can_complete(db):
     job = add_job(db)
     claimed = claim(db, job.id, "w1", now=BASE)
-    assert claimed.attempts == 1
+    assert claimed.execution_count == 1
+    assert claimed.attempts == 0
     assert claimed.worker_id == "w1"
     assert claimed.claim_token and claimed.lease_expires_at == at(60)
     done = queue.complete_job(db, job.id, "w1", claimed.claim_token, outcome="success", now=at(5))
@@ -216,6 +222,7 @@ def test_only_expired_processing_jobs_recovered(session_factory):
 
     assert reload(s2, c_expired.id).status == "queued"
     assert reload(s2, c_expired.id).last_error_code == "LEASE_EXPIRED"
+    assert reload(s2, c_expired.id).infrastructure_failures == 1
     assert reload(s2, c_live.id).status == "processing"
     assert reload(s2, c_parked.id).status == "waiting_capacity"
     assert reload(s2, queued.id).status == "queued"
@@ -238,7 +245,7 @@ def test_active_lease_not_recovered(session_factory):
 
 def test_stale_owner_cannot_finalize_after_reclaim(session_factory):
     s = session_factory()
-    job = add_job(s, kind="x", max_attempts=3)
+    job = add_job(s, kind="x", max_attempts=3, max_infra_attempts=5)
     s.close()
 
     s1 = session_factory()
@@ -246,10 +253,11 @@ def test_stale_owner_cannot_finalize_after_reclaim(session_factory):
     s1.close()
 
     s2 = session_factory()
-    assert queue.recover_stale_jobs(s2, now=at(61)) == 1  # requeued, attempts keep counting 1
+    assert queue.recover_stale_jobs(s2, now=at(61)) == 1  # requeued, business attempts untouched
     assert reload(s2, job.id).status == "queued"
+    assert reload(s2, job.id).attempts == 0
     new_owner = claim(s2, job.id, "w2", now=at(62))
-    assert new_owner.attempts == 2
+    assert new_owner.execution_count == 2
     token2 = new_owner.claim_token
     s2.close()
 
@@ -268,7 +276,7 @@ def test_stale_owner_cannot_finalize_after_reclaim(session_factory):
 
 def test_late_exception_from_stale_worker_cannot_corrupt_new_owner(session_factory):
     s = session_factory()
-    job = add_job(s, kind="x", max_attempts=2)
+    job = add_job(s, kind="x", max_attempts=2, max_infra_attempts=5)
     s.close()
 
     s1 = session_factory()
@@ -276,7 +284,7 @@ def test_late_exception_from_stale_worker_cannot_corrupt_new_owner(session_facto
     stale_token = first.claim_token
     s1.close()
 
-    # lease expires; recovery sees attempts(1) < max(2) -> requeue, then a new owner claims
+    # lease expires; infra counter is still under cap -> requeue, then a new owner claims
     s2 = session_factory()
     assert queue.recover_stale_jobs(s2, now=at(61)) == 1
     queue.claim_next_job(s2, "w2", 60, now=at(62))
@@ -315,12 +323,12 @@ def test_lease_renewal_only_current_owner(db):
     assert queue.renew_lease(db, job.id, "w1", token, 60, now=at(41)) is False
 
 
-def test_exhausted_stale_job_fails_and_recorded_in_attempts(session_factory):
+def test_exhausted_stale_job_fails_expiring_via_infra_counter(session_factory):
     s = session_factory()
-    job = add_job(s, kind="x", max_attempts=1)
+    job = add_job(s, kind="x", max_attempts=5, max_infra_attempts=1)  # 1 infra failure kills it
     s.close()
     s1 = session_factory()
-    first = claim(s1, job.id, "w1", now=BASE)  # attempts -> 1, exhausted at threshold
+    first = claim(s1, job.id, "w1", now=BASE)
     s1.close()
     s2 = session_factory()
     assert queue.recover_stale_jobs(s2, now=at(61)) == 1
@@ -328,11 +336,13 @@ def test_exhausted_stale_job_fails_and_recorded_in_attempts(session_factory):
     assert row.status == "failed"
     assert row.outcome == "failed"
     assert row.finished_at == at(61)
+    assert row.attempts == 0, "lease expiry is infrastructure, not a business attempt"
+    assert row.infrastructure_failures == 1
     with pytest.raises(queue.LostOwnership):
         queue.complete_job(s2, job.id, "w1", first.claim_token, outcome="success", now=at(62))
     assert reload(s2, job.id).status == "failed"
     attempts = s2.scalars(select(RunnerAttempt).where(RunnerAttempt.pipeline_job_id == job.id)).all()
-    assert attempts and attempts[-1].result_type == "failed"
+    assert attempts and attempts[-1].result_type == "stale"
     assert attempts[-1].error_code == "LEASE_EXPIRED"
     s2.close()
 
@@ -349,15 +359,17 @@ def test_waiting_capacity_is_not_business_failure(db):
     assert row.outcome is None
     assert row.last_error_code is None
     assert row.finished_at is None
-    assert parked.attempts == 1
+    assert parked.execution_count == 1
+    assert parked.attempts == 0
 
 
 def test_capacity_transition_does_not_increment_attempts(db):
     job = add_job(db)
     claimed = claim(db, job.id, "w1", now=BASE)
-    assert claimed.attempts == 1
+    assert claimed.execution_count == 1
     queue.move_to_waiting_capacity(db, job.id, "w1", claimed.claim_token, now=at(1))
-    assert reload(db, job.id).attempts == 1
+    assert reload(db, job.id).execution_count == 1
+    assert reload(db, job.id).attempts == 0
 
 
 def test_promote_waiting_capacity_becomes_claimable(session_factory):
@@ -371,12 +383,12 @@ def test_promote_waiting_capacity_becomes_claimable(session_factory):
     assert queue.claim_next_job(s1, "w2", 60, now=at(2)) is None  # not queued yet
     queued_again = queue.promote_waiting_capacity(s1, job.id, now=at(3))
     assert queued_again.status == "queued"
-    assert reload(s1, job.id).attempts == 1  # still no attempt lost
+    assert reload(s1, job.id).execution_count == 1  # parking never cost an execution
     s1.close()
 
     s2 = session_factory()
     reclaim = queue.claim_next_job(s2, "w2", 60, now=at(4))
-    assert reclaim is not None and reclaim.attempts == 2
+    assert reclaim is not None and reclaim.execution_count == 2
     s2.close()
 
 
@@ -394,7 +406,7 @@ def test_runner_capacity_gate_blocks_over_concurrency(db):
     with pytest.raises(queue.RunnerAtCapacity):
         queue.claim_next_job(db, "w1", 60, runner=runner, now=at(2))
 
-    queue.complete_job(db, j1.id, "w1", j1.claim_token, outcome="success", runner=runner, now=at(3))
+    queue.complete_job(db, j1.id, "w1", j1.claim_token, outcome="success", now=at(3))
     assert reload_runner(db, runner.id).active_count == 1
     assert reload_runner(db, runner.id).state == "ready"
 
@@ -410,29 +422,92 @@ def test_runner_unavailable_states_block_claim(db):
             queue.claim_next_job(db, "w1", 60, runner=runner, now=BASE)
 
 
-def test_claim_records_attempt_on_finalize(db):
+def test_attempt_created_at_dispatch_and_closed_on_finalize(db):
     runner = add_runner(db)
     job = add_job(db)
     claimed = claim(db, job.id, "w1", now=BASE, runner=runner)
+
+    open_attempt = queue.get_open_attempt(db, job.id)
+    assert open_attempt is not None, "attempt must exist at dispatch start"
+    assert open_attempt.result_type is None
+    assert open_attempt.runner_instance_id == runner.id
+    assert open_attempt.attempt_number == 1
+    assert open_attempt.started_at == BASE
+
     queue.complete_job(db, job.id, "w1", claimed.claim_token, outcome="success",
-                       runner=runner, checkpoint_before={"pos": 1}, checkpoint_after={"pos": 2}, now=at(5))
-    attempts = db.scalars(select(RunnerAttempt).where(RunnerAttempt.pipeline_job_id == job.id)).all()
-    assert len(attempts) == 1
-    rec = attempts[0]
-    assert rec.runner_instance_id == runner.id
-    assert rec.attempt_number == 1
-    assert rec.result_type == "success"
-    assert rec.started_at == BASE
-    assert rec.finished_at == at(5)
-    assert rec.checkpoint_before == {"pos": 1}
-    assert rec.checkpoint_after == {"pos": 2}
+                       checkpoint_before={"pos": 1}, checkpoint_after={"pos": 2}, now=at(5))
+    assert queue.get_open_attempt(db, job.id) is None
+    rec = db.scalars(
+        select(RunnerAttempt).where(RunnerAttempt.pipeline_job_id == job.id)
+        .execution_options(populate_existing=True)
+    ).all()
+    assert len(rec) == 1
+    assert rec[0].result_type == "success"
+    assert rec[0].finished_at == at(5)
+    assert rec[0].checkpoint_before == {"pos": 1}
+    assert rec[0].checkpoint_after == {"pos": 2}
+
+
+# --- attempts/infra counter helpers ---------------------------------------
+
+
+def test_business_failure_requeues_then_fails(db):
+    job = add_job(db, max_attempts=2)
+    claimed = claim(db, job.id, "w1", now=BASE)
+    r1 = queue.business_failure(db, job.id, "w1", claimed.claim_token, error_code="bad", now=at(1))
+    assert r1.status == "queued"
+    assert r1.attempts == 1
+    assert reload(db, job.id).infrastructure_failures == 0
+
+    c2 = claim(db, job.id, "w1", now=at(2))
+    r2 = queue.business_failure(db, job.id, "w1", c2.claim_token, error_code="bad", now=at(3))
+    assert r2.status == "failed"
+    assert r2.attempts == 2
+
+
+def test_infra_failure_does_not_touch_business_attempts(db):
+    job = add_job(db, max_attempts=5, max_infra_attempts=5)
+    claimed = claim(db, job.id, "w1", now=BASE)
+    r = queue.infra_failure(db, job.id, "w1", claimed.claim_token, result_type="runner_crashed",
+                            error_message="boom", now=at(1))
+    assert r.status == "queued"
+    assert r.attempts == 0
+    assert r.infrastructure_failures == 1
+
+
+def test_quota_exhausted_releases_slot_and_parks_runner(db):
+    runner = add_runner(db)
+    job = add_job(db)
+    claimed = claim(db, job.id, "w1", now=BASE, runner=runner)
+    quota_at = at(10)
+    r = queue.quota_exhausted(db, job.id, "w1", claimed.claim_token, quota_reset_at=quota_at, now=at(1))
+    assert r.status == "queued"
+    assert r.attempts == 0
+    assert reload(db, job.id).infrastructure_failures == 0
+    rr = reload_runner(db, runner.id)
+    assert rr.state == "quota_exhausted"
+    assert rr.quota_reset_at == quota_at
+    assert rr.active_count == 0, "quota failure must release the capacity slot"
+
+
+def test_rate_limited_cooldowns_runner_and_requeues(db):
+    runner = add_runner(db)
+    job = add_job(db)
+    claimed = claim(db, job.id, "w1", now=BASE, runner=runner)
+    r = queue.rate_limited(db, job.id, "w1", claimed.claim_token, retry_after=15, now=at(1))
+    assert reload(db, job.id).status == "queued"
+    assert reload(db, job.id).scheduled_at == at(16)
+    rr = reload_runner(db, runner.id)
+    assert rr.state == "cooldown"
+    assert rr.cooldown_until == at(16)
+    assert rr.active_count == 0
 
 
 # --- request-session model -------------------------------------------------
 
 
 def test_sessions_and_runners_are_linkable(db):
-    session = WorkflowSession(mode="auto", status="active", all_agents_unavailable_policy="requeue")
+    session = WorkflowSession(mode="auto", status="active", all_agents_unavailable_policy="pause_auto_resume")
     db.add(session)
     db.commit()
     runner = RunnerInstance(workflow_session_id=session.id, runner_type="story", enabled=True)

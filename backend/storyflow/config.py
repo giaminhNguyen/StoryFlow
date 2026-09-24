@@ -12,9 +12,13 @@ class Settings:
     database_url: str = f"sqlite:///{(RUNTIME_DIR / 'storyflow.db').as_posix()}"
     busy_timeout_ms: int = 5000
     max_attempts: int = 5
+    max_infra_attempts: int = 5
     lease_seconds: int = 60
+    cooldown_seconds: int = 30
+    quota_reset_seconds: int = 120
+    max_failover_passes: int = 8
     claim_retries: int = 10
-    default_role: str = "worker"
+    default_role: str = "general_worker"
 
 
 settings = Settings()
