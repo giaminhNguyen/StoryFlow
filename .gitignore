@@ -1,26 +1,54 @@
-# Generated dependencies — not StoryFlow source (produced by bootstrap.py)
+# Everything below is produced locally on each machine (setup, running the app, tests) and must
+# never be committed. Only source code, docs, lock files and *.example templates belong in git.
+
+# Generated dependencies (produced by bootstrap.py from sources.lock.json)
 /external/
 /skills/
+
+# Runtime data: database, artifacts (sources, stories, audio), backups, logs
 /runtime/
+runtime-server.log
+*.log
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Generated media (audio output must live under runtime/, this is a safety net)
+*.wav
+*.mp3
+*.part
+
+# Local provider configuration (machine specific: paths, voice, precision) - never commit
+.env
+.env.*
+!.env.example
+*.env
+*.env.local
+*.env.bak
+*.bak
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# OS / editor
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+node_modules/
+*.tsbuildinfo
+coverage/
+
+# OS / editor / local tooling
 Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
-# Frontend build artifacts
-/frontend/node_modules/
-/frontend/dist/
-
-# Local provider configuration (never commit)
-.env
-*.env.local
-
-backend/.env.bak
-runtime-server.log
+.claude/
