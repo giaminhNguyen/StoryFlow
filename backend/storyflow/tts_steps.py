@@ -480,6 +480,7 @@ class AudioStep(StepHandler):
         gen = db.get(AudioGeneration, domain_id, populate_existing=True)
         now = ctx.clock()
         if have >= set(range(1, total + 1)):
+            assemble_final_audio(ctx.store, gen.store_dir, total)
             gen.status = DomainStatus.COMPLETED.value
             gen.chunk_count = total
             gen.error_code = gen.error_message = None
@@ -495,6 +496,41 @@ class AudioStep(StepHandler):
         if gen is not None:
             _fail(gen, job, ctx.clock())
             db.commit()
+
+
+FINAL_AUDIO_NAME = "final.wav"
+CHUNK_GAP_SECONDS = 0.3
+
+
+def assemble_final_audio(store: ArtifactStore, store_dir: str, total: int) -> str | None:
+    """Concatenate ``0001.wav`` .. ``NNNN.wav`` into one ``final.wav`` next to them (0.3 s silence between).
+
+    Best effort: the chunks stay the source of truth, so a missing/odd chunk or an I/O error only
+    means there is no final file (returns None) and never fails the audio step. Idempotent.
+    """
+    try:
+        params, frames = None, []
+        for i in range(1, total + 1):
+            with wave.open(str(store.resolve(f"{store_dir}/{i:04d}.wav")), "rb") as w:
+                p = (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getcomptype())
+                if params is None:
+                    params = p
+                elif p != params:
+                    return None
+                frames.append(w.readframes(w.getnframes()))
+        if params is None:
+            return None
+        channels, width, rate, _ = params
+        silence = bytes(1) * (int(rate * CHUNK_GAP_SECONDS) * channels * width)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setnchannels(channels)
+            out.setsampwidth(width)
+            out.setframerate(rate)
+            out.writeframes(silence.join(frames))
+        return store.write(f"{store_dir}/{FINAL_AUDIO_NAME}", buf.getvalue())
+    except (OSError, EOFError, wave.Error, ValueError):
+        return None
 
 
 def sync_chunks(db, ctx, audio_generation_id) -> list[int]:
