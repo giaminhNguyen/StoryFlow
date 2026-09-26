@@ -91,11 +91,30 @@ _DEMO_LINES = [
 ]
 
 
+DEMO_CHANNEL_URL = "https://www.youtube.com/@demo"
+DEMO_VIDEO_IDS = ("demoVideo01", "demoVideo02", "demoVideo03")   # valid 11-char ids: usable through /sources
+DEMO_NO_SUBTITLE_ID = "demoNoSub01"                              # listed by the demo channel, has no subtitle
+
+
+def _demo_track(lines) -> dict:
+    return {"language": "English", "language_code": "en", "is_generated": False, "is_translatable": True,
+            "snippets": [{"text": line, "start": float(i * 3), "duration": 3.0} for i, line in enumerate(lines)]}
+
+
 def demo_subtitle_client() -> FakeSubtitleClient:
     """Deterministic offline transcript for ``--fake`` demos and the frontend smoke test."""
-    track = {"language": "English", "language_code": "en", "is_generated": False, "is_translatable": True,
-             "snippets": [{"text": line, "start": float(i * 3), "duration": 3.0} for i, line in enumerate(_DEMO_LINES)]}
-    return FakeSubtitleClient({DEMO_VIDEO_ID: {"tracks": [track]}})
+    store = {DEMO_VIDEO_ID: {"tracks": [_demo_track(_DEMO_LINES)]}}
+    for n, vid in enumerate(DEMO_VIDEO_IDS, 1):
+        store[vid] = {"tracks": [_demo_track([f"Chapter {n}, line {i + 1}: {line}" for i, line in enumerate(_DEMO_LINES)])]}
+    return FakeSubtitleClient(store)
+
+
+def demo_video_lister():
+    """Offline stand-in for the yt-dlp lister: ``@demo`` = 3 videos with subtitles + 1 without (newest first)."""
+    from ..sources import FakeVideoLister, VideoRef
+    videos = [VideoRef(DEMO_NO_SUBTITLE_ID, "Demo video without subtitles", 600)]
+    videos += [VideoRef(vid, f"Demo video {n}", 600) for n, vid in enumerate(DEMO_VIDEO_IDS, 1)]
+    return FakeVideoLister({DEMO_CHANNEL_URL: ("Demo channel", videos)})
 
 
 def deterministic_fake_providers(store: ArtifactStore, *, chunking: dict | None = None) -> list[RunnerProvider]:
@@ -192,7 +211,8 @@ def _fake_stack(subtitle_client, providers):
     statuses = [ProviderStatus("fake", kind, FAKE, f"deterministic fake {kind} (offline demo)")
                 for kind in ("subtitle", "story", "tts")]
     return ProviderStack(ProviderConfig(subtitle_provider="fake", story_runner="fake", tts_engine="fake"),
-                         subtitle_client, list(providers), [(lambda s=s: s) for s in statuses])
+                         subtitle_client, list(providers), [(lambda s=s: s) for s in statuses],
+                         video_lister=demo_video_lister())
 
 
 def build_runtime(*, database_url: str | None = None, artifact_root=None,

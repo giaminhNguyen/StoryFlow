@@ -221,6 +221,7 @@ class ProjectStatus(str, enum.Enum):
     stops advancing the project but the workflow carries on (see storyflow/policy.py)."""
 
     ACTIVE = "active"
+    COMPLETED = "completed"              # every step done (recorded by the orchestrator so finished projects cost O(1))
     SKIPPED = "skipped"                  # e.g. the video has no usable subtitle
     NEEDS_ATTENTION = "needs_attention"  # failed for good; an operator must look at it
 

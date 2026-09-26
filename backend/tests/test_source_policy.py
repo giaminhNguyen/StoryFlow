@@ -237,7 +237,7 @@ def test_skip_policy_lets_the_rest_of_the_batch_finish(db, session_factory, stor
     assert res.failed == [] and [(p, s) for p, s, _ in res.ended] == [(bad.id, "source")]
     assert res.projects[good.id].step is None and res.projects[good.id].terminal is None
     assert res.projects[bad.id].terminal == "skipped" and res.projects[bad.id].error_code == "subtitles_unavailable"
-    assert fresh(db, StoryProject, good.id).status == "active" and fresh(db, StoryProject, bad.id).status == "skipped"
+    assert fresh(db, StoryProject, good.id).status == "completed" and fresh(db, StoryProject, bad.id).status == "skipped"
 
 
 def test_pause_policy_keeps_the_legacy_behaviour(db, session_factory, store, clock):

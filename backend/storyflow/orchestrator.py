@@ -120,6 +120,7 @@ class Orchestrator:
         self.source = source
         self.steps = list(steps)
         self.chain: list = [source, *self.steps]
+        self._fingerprints: dict[str, tuple] = {}   # workflow id -> state after its last round (see run_round)
 
     # ------------------------------------------------------------------ helpers
 
@@ -293,8 +294,11 @@ class Orchestrator:
         return [h for h in self.chain if getattr(h, "enabled", None) is None or h.enabled(db, self.ctx, project)]
 
     def _advance_project(self, db, project_id: str, wf: ChannelWorkflow, now, res: TickResult) -> None:
-        if self._is_terminal(db, project_id):
-            return  # skipped / needs_attention: nothing more to do for this project
+        db.expire_all()
+        project = db.get(StoryProject, project_id)
+        if project is None or project.status in TERMINAL_PROJECT_STATUSES \
+                or project.status == ProjectStatus.COMPLETED.value:
+            return  # skipped / needs_attention / completed: nothing more to do for this project
         for handler in self._handlers(db, project_id):
             outcome = _AGAIN
             for _ in range(_MAX_STEP_PASSES):
@@ -306,16 +310,29 @@ class Orchestrator:
             return  # waiting, failed, or (bounded) unresolved: nothing later may advance
 
     def _position(self, db, project_id: str) -> ProjectState:
+        """Where the project is. The session is refreshed ONCE (nothing here writes, so nothing changes between
+        the step reads); a finished project is recorded as ``completed`` so later calls are a single row read."""
         db.expire_all()
         project = db.get(StoryProject, project_id)
-        if project is not None and project.status in TERMINAL_PROJECT_STATUSES:
-            return ProjectState(None, None, error_code=project.status_reason, terminal=project.status)
+        if project is not None:
+            if project.status in TERMINAL_PROJECT_STATUSES:
+                return ProjectState(None, None, error_code=project.status_reason, terminal=project.status)
+            if project.status == ProjectStatus.COMPLETED.value:
+                return ProjectState(None, None)
         for handler in self._handlers(db, project_id):
-            db.expire_all()
-            view = handler.status(db, self.ctx, db.get(StoryProject, project_id))
+            view = handler.status(db, self.ctx, project)
             if view.status is not StepStatus.COMPLETED:
                 return ProjectState(handler.step, view.status, view.domain_id, view.pipeline_job_id, view.error_code)
+        if project is not None and project.status == ProjectStatus.ACTIVE.value:
+            self._mark_completed(db, project_id)
         return ProjectState(None, None)
+
+    def _mark_completed(self, db, project_id: str) -> None:
+        db.execute(update(StoryProject)
+                   .where(StoryProject.id == project_id, StoryProject.status == ProjectStatus.ACTIVE.value)
+                   .values(status=ProjectStatus.COMPLETED.value, updated_at=self.ctx.clock())
+                   .execution_options(synchronize_session=False))
+        db.commit()
 
     # ------------------------------------------------------------------ public API
 
@@ -333,17 +350,23 @@ class Orchestrator:
             res.recovered = queue.recover_stale_jobs(db, now=now)
             pids = self._project_ids(db, workflow_id)
             slots = batch_from_config(wf.config).max_active      # None = every project at once (legacy)
+            seen: dict[str, ProjectState] = {}    # positions that cannot have changed since they were read
             for pid in pids:
                 if slots is not None:
-                    if self._position(db, pid).step is None:
+                    pos = self._position(db, pid)
+                    if pos.step is None:
+                        seen[pid] = pos
                         continue                                  # completed / skipped: takes no slot
                     if slots <= 0:
-                        continue                                  # waits for a free slot
+                        seen[pid] = pos
+                        continue                                  # waits for a free slot (untouched this tick)
                     slots -= 1
                 self._advance_project(db, pid, wf, now, res)
-                if slots is not None and self._position(db, pid).step is None:
-                    slots += 1              # finished / ended during this very tick: the next project may start now
-            res.projects = {pid: self._position(db, pid) for pid in pids}
+                if slots is not None:
+                    after = seen[pid] = self._position(db, pid)
+                    if after.step is None:
+                        slots += 1          # finished / ended during this very tick: the next project may start now
+            res.projects = {pid: seen[pid] if pid in seen else self._position(db, pid) for pid in pids}
             failure = self._first_failure(res)
             if failure is not None:
                 project_id, step, error_code = failure
@@ -396,10 +419,14 @@ class Orchestrator:
         """tick -> one Dispatcher.run_round for the workflow's session -> tick again so a job
         that just finished advances the chain immediately."""
         now = self._now(now)
-        start = self._fingerprint(workflow_id)
+        # the previous round's end state is this round's start state (one fewer full scan per round); a change
+        # made in between only makes ``progressed`` True, which is always safe
+        start = self._fingerprints.get(workflow_id)
+        if start is None:
+            start = self._fingerprint(workflow_id)
         before = self.tick(workflow_id, now=now)
         if before.workflow_status != ChannelWorkflowStatus.ACTIVE.value:
-            end = self._fingerprint(workflow_id, before.projects)
+            end = self._fingerprints[workflow_id] = self._fingerprint(workflow_id, before.projects)
             return RoundResult(before.workflow_status, None, None, end != start, before, before)
         db = self.ctx.session_factory()
         try:
@@ -411,8 +438,9 @@ class Orchestrator:
             outcome, job_id = self.dispatcher.run_round(db, session, now=now)
         finally:
             db.close()
-        after = self.tick(workflow_id, now=now)
-        end = self._fingerprint(workflow_id, after.projects)
+        # nothing was dispatched -> nothing can have finished: the first tick's view is still the truth
+        after = before if job_id is None else self.tick(workflow_id, now=now)
+        end = self._fingerprints[workflow_id] = self._fingerprint(workflow_id, after.projects)
         return RoundResult(after.workflow_status, outcome, job_id, end != start, before, after)
 
     def run_until_idle(self, workflow_id: str, *, max_rounds: int = 200, now=None) -> RunResult:

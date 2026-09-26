@@ -652,6 +652,81 @@ def step_lifecycle(ctx: Ctx) -> str:
     return "; ".join(notes)
 
 
+DEMO_CHANNEL = "https://www.youtube.com/@demo"
+
+
+def step_batch(ctx: Ctx) -> str:
+    """A whole channel through the real server (offline demo channel): one video has no subtitle and is skipped
+    while the rest finish (window of 2, quality preset = review + revision), each completed project ends with ONE
+    joined audio file, a skipped project can be retried, and a re-scan adds nothing new."""
+    srv, _flow = ctx.shared()
+    h = srv.http
+    notes = []
+    _s, data = h.json("POST", "/api/workflows", {
+        "name": "batch smoke", "client_key": f"smoke-{uuid.uuid4().hex[:12]}",
+        "config": {"source": {"languages": ["en"]}, "preset": "quality", "batch": {"max_active": 2},
+                   "failure_policy": {"on_no_subtitle": "skip", "on_permanent_error": "continue"}}})
+    wid = data["workflow"]["id"]
+    cfg_seen = get_workflow(h, wid)
+    if cfg_seen.get("preset") != "quality":
+        raise StepFailure(f"workflow preset is {cfg_seen.get('preset')!r}, expected quality")
+
+    expect_error(h, "POST", f"/api/workflows/{wid}/sources", 422, {"validation"}, {"sources": ["https://example.com/x"]})
+    _s, res = h.json("POST", f"/api/workflows/{wid}/sources", {
+        "sources": [DEMO_CHANNEL, "https://youtu.be/demoVideo01"], "limit": 10}, expect=(201,))
+    result = res["result"]
+    if len(result["added"]) != 4 or [d["reason"] for d in result["duplicates"]] != ["repeated"]:
+        raise StepFailure(f"sources: added {len(result['added'])}, duplicates {result['duplicates']}")
+    _s, feeds = h.json("GET", f"/api/workflows/{wid}/feeds")
+    if [(f["kind"], f["known_count"]) for f in feeds["feeds"]] != [("channel", 4)]:
+        raise StepFailure(f"feeds: {feeds['feeds']}")
+    notes.append("channel expanded to 4 projects, repeated link deduplicated")
+
+    assign_runner(h, wid)
+    h.json("POST", f"/api/workflows/{wid}/start", expect=(200,))
+    wf = wait_status(h, wid, {"finished", "paused"}, 240)
+    if wf["status"] != "finished":
+        raise StepFailure(f"batch ended as {wf['status']}/{wf.get('status_reason')} (a skipped video must not pause it)")
+    counts = wf["counts"]
+    if (counts["completed"], counts["skipped"], counts["failed"]) != (3, 1, 0):
+        raise StepFailure(f"batch counts {counts}")
+    skipped = [p for p in wf["projects"] if p["state"] == "skipped"]
+    if len(skipped) != 1 or skipped[0]["status_reason"] != "subtitles_unavailable":
+        raise StepFailure(f"skipped projects: {[(p['title'], p['status_reason']) for p in skipped]}")
+    notes.append("3 completed + 1 skipped, workflow finished")
+
+    for p in wf["projects"]:
+        if p["state"] != "completed":
+            continue
+        proj = h.json("GET", f"/api/projects/{p['id']}")[1]
+        final = (proj.get("audio") or {}).get("final_path")
+        if not final:
+            raise StepFailure(f"project {p['title']} has no final audio path")
+        st, hd, body = h.request("GET", artifact_url(final))
+        if st != 200 or body[:4] != b"RIFF" or "audio/wav" not in hd.get("content-type", ""):
+            raise StepFailure(f"final audio -> HTTP {st}, head {body[:4]!r}")
+        review = proj.get("review") or {}
+        if review.get("status") != "completed" or review.get("verdict") not in ("approve", "revise"):
+            raise StepFailure(f"quality preset produced no completed review: {review}")
+    notes.append("every completed project has review + one joined final.wav")
+
+    st_id = skipped[0]["id"]
+    expect_error(h, "POST", f"/api/projects/{[p for p in wf['projects'] if p['state'] == 'completed'][0]['id']}/retry",
+                 409, {"not_retryable"})
+    h.json("POST", f"/api/projects/{st_id}/retry", expect=(200,))
+    wf = wait_status(h, wid, {"finished", "paused"}, 120)
+    again = [p for p in wf["projects"] if p["id"] == st_id][0]
+    if wf["status"] != "finished" or again["state"] != "skipped":
+        raise StepFailure(f"retried skipped project is {again['state']} in a {wf['status']} workflow")
+    notes.append("retry of the skipped project re-opens and re-finishes")
+
+    _s, sync = h.json("POST", f"/api/workflows/{wid}/sync", expect=(200,))
+    if sync["result"]["added"] or sync["result"]["errors"]:
+        raise StepFailure(f"a re-scan of an unchanged channel added/failed: {sync['result']}")
+    notes.append("re-scan adds nothing")
+    return "; ".join(notes)
+
+
 def _project_integrity(h: Http, pid: str) -> dict:
     proj = h.json("GET", f"/api/projects/{pid}")[1]
     idx = [c["chunk_index"] for c in (proj.get("audio") or {}).get("chunks") or []]
@@ -819,6 +894,7 @@ STEPS: list[Step] = [
     Step(10, "backup", "backup + restore smoke", step_backup),
     Step(11, "shutdown", "startup + graceful shutdown", step_shutdown),
     Step(12, "real", "real-provider smoke (opt-in)", step_real),
+    Step(13, "batch", "channel batch: skip, window, review, final.wav, retry, sync", step_batch),
 ]
 
 

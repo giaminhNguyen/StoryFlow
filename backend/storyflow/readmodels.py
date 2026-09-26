@@ -238,6 +238,7 @@ class AudioInfo:
     error_code: str | None
     registered_chunks: int
     chunks: list = field(default_factory=list)   # list[AudioChunkInfo]
+    final_path: str | None = None                # the single joined audio file (final.wav), once the run is complete
 
 
 @dataclass(frozen=True)
@@ -677,6 +678,19 @@ class ReadModels:
                 finished_at=wf.finished_at, projects=snaps, runners=runners, capacity=capacity,
                 preset=_preset_of(wf.config))
 
+    def _final_audio_path(self, audio_row) -> str | None:
+        """Relative path of ``final.wav`` when the run completed and the joined file really exists."""
+        from .tts_steps import FINAL_AUDIO_NAME
+
+        store_dir = _rel(audio_row.store_dir)
+        if store_dir is None or audio_row.status != DomainStatus.COMPLETED.value:
+            return None
+        rel = f"{store_dir}/{FINAL_AUDIO_NAME}"
+        try:
+            return rel if self.ctx.store.exists(rel) else None
+        except ValueError:      # unsafe path: never expose it
+            return None
+
     def list_feeds(self, workflow_id: str) -> list[FeedSnapshot]:
         """Channels / playlists expanded into this workflow, with how many of their projects ended early."""
         with self.ctx.session_factory() as db:
@@ -826,7 +840,8 @@ class ReadModels:
                 chunk_count=audio_row.chunk_count or 0, store_dir=_rel(audio_row.store_dir),
                 error_code=audio_row.error_code, registered_chunks=registered,
                 chunks=[AudioChunkInfo(c.chunk_index, _rel(c.artifact_path), c.duration_ms or 0)
-                        for c in chunk_rows])
+                        for c in chunk_rows],
+                final_path=self._final_audio_path(audio_row))
 
         review_row = db.scalars(select(StoryReview).where(StoryReview.story_project_id == project.id)
                                 .order_by(StoryReview.round_number.desc(), StoryReview.created_at.desc(),

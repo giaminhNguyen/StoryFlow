@@ -43,6 +43,7 @@ export interface AudioChunkInfo { chunk_index: number; artifact_path: string | n
 export interface AudioInfo {
   id: string; run_number: number; status: string; chunk_count: number; store_dir: string | null;
   error_code: string | null; registered_chunks: number; chunks: AudioChunkInfo[];
+  final_path?: string | null;   // the single joined audio file, when the run is complete
 }
 export type ReviewVerdict = "approve" | "revise";
 export type IssueSeverity = "low" | "medium" | "high";

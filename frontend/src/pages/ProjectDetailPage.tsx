@@ -90,6 +90,13 @@ function ProjectBody({ project, client }: { project: ProjectSnapshot; client: Ap
         {audio ? (
           <>
             <p>Run {audio.run_number}: {audio.status}; {audio.registered_chunks}/{audio.chunk_count} chunks registered</p>
+            {audio.final_path && (
+              <div className="final-audio" role="group" aria-label="Final audio">
+                <strong>Full audio</strong>{" "}
+                <audio controls preload="none" aria-label="Full audio" src={client.artifactUrl(audio.final_path)} />{" "}
+                <a href={client.artifactUrl(audio.final_path)} download>Download</a>
+              </div>
+            )}
             <AudioChunkList client={client} chunks={audio.chunks} />
           </>
         ) : <p>Audio not generated yet</p>}

@@ -123,3 +123,24 @@ describe("ProjectDetailPage", () => {
     expect(within(details).getAllByRole("link").length).toBeGreaterThan(3);
   });
 });
+
+describe("ProjectDetailPage final audio", () => {
+  it("offers the single joined audio file when the run produced one", async () => {
+    const done = makeCompletedProject();
+    const project = { ...done, audio: { ...done.audio!, final_path: "projects/p1/audio/t1/run-001/final.wav" } };
+    const c = fakeClient(async () => project);
+    render(<ProjectDetailPage projectId="p1" client={c} />);
+    const group = await screen.findByRole("group", { name: "Final audio" });
+    expect(within(group).getByLabelText("Full audio")).toHaveAttribute(
+      "src", "http://x/api/artifacts/projects/p1/audio/t1/run-001/final.wav");
+    expect(within(group).getByRole("link", { name: "Download" })).toHaveAttribute(
+      "href", "http://x/api/artifacts/projects/p1/audio/t1/run-001/final.wav");
+  });
+
+  it("shows no full-audio player when there is no joined file", async () => {
+    const c = fakeClient(async () => makeCompletedProject());
+    render(<ProjectDetailPage projectId="p1" client={c} />);
+    expect(await screen.findByText(/chunks registered/)).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Final audio" })).toBeNull();
+  });
+});
