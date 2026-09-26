@@ -157,9 +157,15 @@ that had already finished is re-opened.
 ### How many projects run at once (`batch`)
 
 `"batch": {"max_active": 2}` in the workflow config (default for new workflows: 2; `null` = all at once). Only the first
-N unfinished projects, in creation order (= newest video first), are advanced. When one completes, is skipped or needs
-attention, the next one starts immediately, so stages overlap (one story is being written while another is read aloud)
-while YouTube is not asked for every video at once. Channels are simply worked through in the order they were added.
+N unfinished projects, in creation order (= newest video first), run the job-backed steps (canon / story / review /
+tts / audio). When one completes, is skipped or needs attention, the next one starts immediately, so stages overlap (one
+story is being written while another is read aloud). Channels are simply worked through in the order they were added.
+
+The window does **not** hold back subtitles: the `source` step is inline (no job, no runner slot), so every waiting
+project outside the window also fetches its subtitles ahead of time. These fetches run **one after another inside the
+runtime tick** (not as parallel subtitle workers), with the usual failure policy (transient errors back off durably,
+`on_no_subtitle: skip` ends only that project). A very large batch can therefore make the first tick long (the runtime
+iteration counter does not move while it runs) and can trigger provider rate limits / backoff.
 A finished project is recorded as `completed` (project `status`), so a batch of hundreds costs one row read per finished
 project instead of a walk through every step (60 projects: about 3x faster per runtime iteration than before).
 

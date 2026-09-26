@@ -299,6 +299,10 @@ class SourceStep(InlineStepHandler):
         marks it ``needs_attention``. The step still returns FAILED; the orchestrator sees the terminal
         project status and does NOT pause the workflow. With ``pause`` (default) nothing changes.
     Snapshots are immutable: an existing active snapshot is returned as-is, never replaced.
+
+    The step is inline (no job, no runner capacity), so the orchestrator runs it for EVERY project of the
+    batch, including those still waiting for a ``batch.max_active`` slot: subtitles are downloaded up front,
+    canon / story / review / tts / audio keep honouring the window.
     """
 
     step = "source"

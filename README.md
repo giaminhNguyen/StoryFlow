@@ -133,7 +133,7 @@ curl -s $API/workflows/<workflow-id>                            # counts, per-pr
 |---|---|
 | `"preset": "fast" \| "balanced" \| "quality"` | `fast` = no review; `balanced` = one editor call records verdict + issues; `quality` = the editor also corrects the story (up to 2 rounds) |
 | `"failure_policy"` | retries with backoff for blocked subtitle requests; `on_no_subtitle: skip` and `on_permanent_error: continue` end only the affected project; systemic problems (quota, login, runner down) always pause the workflow, and a circuit breaker stops a batch that fails the same way 3 times |
-| `"batch": {"max_active": 2}` | only the first N unfinished projects run, so stages overlap without asking YouTube for every video at once |
+| `"batch": {"max_active": 2}` | only the first N unfinished projects run canon / story / review / tts / audio, so stages overlap; subtitles are still prefetched for every waiting project, one after another inside the runtime tick (not in parallel), so a very large batch can make the first tick long or trigger provider backoff |
 | `"story": {"target_length": 9000}` | words; the default is "at least as long as the source" (capped at 15,000) |
 
 Details, all fields and error codes are in [docs/OPERATIONS.md](docs/OPERATIONS.md).

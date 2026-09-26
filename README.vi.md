@@ -133,7 +133,7 @@ curl -s $API/workflows/<workflow-id>                            # số lượng,
 |---|---|
 | `"preset": "fast" \| "balanced" \| "quality"` | `fast` = không review; `balanced` = một lần gọi editor ghi lại nhận xét + các vấn đề; `quality` = editor còn sửa lại truyện (tối đa 2 vòng) |
 | `"failure_policy"` | retry kèm backoff khi yêu cầu lấy phụ đề bị chặn; `on_no_subtitle: skip` và `on_permanent_error: continue` chỉ kết thúc project bị ảnh hưởng; các sự cố mang tính hệ thống (hết quota, đăng nhập, runner ngừng hoạt động) luôn làm workflow tạm dừng, và một circuit breaker sẽ dừng batch nếu nó thất bại theo cùng một kiểu 3 lần |
-| `"batch": {"max_active": 2}` | chỉ N project chưa xong đầu tiên được chạy, để các giai đoạn chồng lên nhau mà không phải hỏi YouTube tất cả video cùng lúc |
+| `"batch": {"max_active": 2}` | chỉ N project chưa xong đầu tiên được chạy canon / story / review / tts / audio, để các giai đoạn chồng lên nhau; phụ đề vẫn được tải trước cho mọi project đang chờ, lần lượt từng cái trong một tick của runtime (không song song), nên batch rất lớn có thể làm tick đầu kéo dài hoặc khiến provider backoff |
 | `"story": {"target_length": 9000}` | đơn vị là từ; mặc định là "ít nhất dài bằng bản gốc" (tối đa 15.000) |
 
 Chi tiết, đầy đủ các trường và mã lỗi nằm trong [docs/OPERATIONS.md](docs/OPERATIONS.md) (tiếng Anh).

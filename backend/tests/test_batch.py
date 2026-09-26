@@ -93,11 +93,14 @@ class BatchStack(Stack):
                              f"{[p.state for p in snap.projects]}")
 
     def observe(self, snap):
+        # "started" = doing heavy work, i.e. it entered canon (its first job-backed step). Subtitles are
+        # downloaded for EVERY project up front (see ``Orchestrator._prefetch_source``), so having a source
+        # snapshot is NOT a slot: a canon row is.
         closed = sum(1 for p in snap.projects if p.state in CLOSED)
-        open_ids = [p.id for p in snap.projects if p.source is not None and p.state not in CLOSED]
+        open_ids = [p.id for p in snap.projects if p.canon is not None and p.state not in CLOSED]
         self.max_open = max(self.max_open, len(open_ids))
         for p in snap.projects:
-            if p.source is not None and p.id not in self.start_order:
+            if p.canon is not None and p.id not in self.start_order:
                 self.start_order.append(p.id)
                 self.closed_when_started[p.id] = closed
 
@@ -154,14 +157,28 @@ def test_no_window_starts_every_project_at_once(make_stack):
     assert s.max_open == 5
 
 
-def test_projects_beyond_the_window_have_no_side_effects_yet(make_stack):
+def test_projects_beyond_the_window_prefetch_their_subtitles_only(make_stack):
+    """Outside the window a project downloads its transcript (inline step, no job) but starts NO heavy work."""
     s = make_stack(IDS[:4], batch={"max_active": 1})
     s.round()
     with s.app.session_factory() as db:
         snapshots = db.scalars(select(SourceSnapshot.story_project_id)).all()
-        assert snapshots == [s.pids[0]]                                    # no subtitle fetch for the waiting ones
+        assert sorted(snapshots) == sorted(s.pids)                              # every subtitle is fetched up front
         jobs = db.scalars(select(PipelineJob)).all()
         assert jobs and {j.payload_json["inputs"]["project_id"] for j in jobs} == {s.pids[0]}   # only its own jobs
+    snap = s.read.get_workflow(s.wf)
+    assert [p.current_step for p in snap.projects[1:]] == ["canon", "canon", "canon"]
+
+
+def test_prefetching_subtitles_is_idempotent(make_stack):
+    """Ticking again never re-fetches: the snapshot is frozen and the step reports COMPLETED."""
+    s = make_stack(IDS[:3], batch={"max_active": 1})
+    s.round()
+    s.round()
+    with s.app.session_factory() as db:
+        rows = db.execute(select(SourceSnapshot.story_project_id, SourceSnapshot.snapshot_number)).all()
+    assert set(rows) == {(pid, 1) for pid in s.pids}                           # one snapshot per project, no duplicates
+    assert s.start_order == [s.pids[0]]                                       # the window did not move
 
 
 def test_run_until_idle_completes_a_windowed_batch(make_stack):
@@ -179,7 +196,8 @@ def test_a_skipped_video_frees_its_slot_within_the_same_tick(make_stack):
         statuses = {p.video_id: p.status for p in db.scalars(select(StoryProject))}
         started = set(db.scalars(select(SourceSnapshot.story_project_id)).all())
     assert statuses[MISSING] == statuses[MISSING2] == "skipped"
-    assert started == {s.pids[2]}                                          # the next good video took the slot now
+    assert started == {s.pids[2], s.pids[3]}                                    # the next good video took the slot now
+                                                                               # and the one behind it prefetched its subtitle
     assert [e[0] for e in tick.ended] == s.pids[:2] and tick.workflow_status == "active"
     snap = s.run(s.finished)
     assert [p.state for p in snap.projects] == ["skipped", "skipped", "completed", "completed"]
@@ -207,7 +225,9 @@ def test_a_retry_exhausted_project_frees_the_window(make_stack):
     clock = Clock()
     s.app.ctx.clock = clock
     snap = s.round()
-    assert s.project(snap, 0).block.kind == "delayed" and s.project(snap, 1).source is None   # slot is held
+    assert s.project(snap, 0).block.kind == "delayed"
+    assert s.project(snap, 1).source is not None            # prefetched anyway: the inline step needs no slot ...
+    assert s.project(snap, 1).current_step == "canon" and s.start_order == []  # ... but no heavy step started
     clock.advance(40)
     snap = s.run(s.finished)
     first, second = s.project(snap, 0), s.project(snap, 1)

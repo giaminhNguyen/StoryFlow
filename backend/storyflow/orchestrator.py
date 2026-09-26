@@ -328,6 +328,26 @@ class Orchestrator:
         project = db.get(StoryProject, project_id)
         return project is not None and project.status in TERMINAL_PROJECT_STATUSES
 
+    def _prefetch_source(self, db, project_id: str, wf: ChannelWorkflow, now, res: TickResult) -> None:
+        """Run ONLY the inline source step of a project that is waiting for a batch slot.
+
+        Fetching the transcript is the slow, provider-bound part of a batch and it creates NO job, so it
+        does not compete for ``batch.max_active``: every waiting project downloads its subtitles while the
+        window is still busy, and canon / story / review / tts / audio (the expensive, job-backed steps) keep
+        waiting for their slot exactly as before. The caller's slot accounting is untouched: a prefetched
+        project is still queued, in creation order, for a slot on a later tick.
+
+        Failures keep the source step's own semantics (transient -> durable backoff, ``skip`` / ``continue`` ->
+        only this project ends, otherwise the workflow pauses), because this is the very same ``_step`` call
+        the in-window path makes.
+
+        Scope of the decoupling: this only takes the source step OUT of the batch window. It is NOT a
+        wall-clock concurrency guarantee against a synchronous runner - every prefetch happens in sequence
+        inside one tick, before that tick dispatches, so a very large batch pays the provider latency once
+        up front and the round that pays it dispatches later. Bound it per tick (a cap) if that ever matters.
+        """
+        self._step(db, self.source, project_id, wf, now, res)
+
     def _handlers(self, db, project_id: str) -> list:
         """The chain of THIS project: steps that are switched off for its workflow (``enabled`` False, e.g.
         ``review`` under the fast preset) do not exist for it."""
@@ -419,24 +439,33 @@ class Orchestrator:
             slots = batch_from_config(wf.config).max_active      # None = every project at once (legacy)
             seen: dict[str, ProjectState] = {}    # positions that cannot have changed since they were read
             for pid in pids:
+                in_window = True
                 if slots is not None:
                     pos = self._position(db, pid)
                     if pos.step is None:
                         seen[pid] = pos
                         continue                                  # completed / skipped: takes no slot
                     if slots <= 0:
+                        # no free slot: the heavy steps wait, but the project may still fetch its subtitles
+                        # (inline, no job -> nothing competes for capacity). See ``_prefetch_source``.
+                        in_window = False
                         seen[pid] = pos
-                        continue                                  # waits for a free slot (untouched this tick)
-                    slots -= 1
+                        if pos.step != self.source.step:
+                            continue
+                    else:
+                        slots -= 1
                 try:
-                    self._advance_project(db, pid, wf, now, res)
+                    if in_window:
+                        self._advance_project(db, pid, wf, now, res)
+                    else:
+                        self._prefetch_source(db, pid, wf, now, res)
                 except OperationalError:
                     raise                   # database busy / locked: transient, the next iteration simply retries
                 except Exception:  # noqa: BLE001 - one bad project must not stop the round for the others
                     self._contain(db, wf, pid, res)
                 if slots is not None:
                     after = seen[pid] = self._safe_position(db, pid)
-                    if after.step is None:
+                    if in_window and after.step is None:
                         slots += 1          # finished / ended during this very tick: the next project may start now
             res.projects = {pid: seen[pid] if pid in seen else self._safe_position(db, pid) for pid in pids}
             failure = self._first_failure(res)
