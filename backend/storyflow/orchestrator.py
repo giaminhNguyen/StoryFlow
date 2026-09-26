@@ -33,11 +33,13 @@ from .models import (
     JobStatus,
     PauseReason,
     PipelineJob,
+    ProjectStatus,
     StoryProject,
     TERMINAL_PROJECT_STATUSES,
     WorkflowSession,
 )
 from .pipeline import InlineStepHandler, PipelineContext, StepHandler, StepStatus
+from .policy import PERMANENT, batch_from_config, policy_from_config, terminal_status_for
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,8 @@ class Orchestrator:
                   "status_reason": reason.value if reason else None, "status_detail": detail}
         if new is ChannelWorkflowStatus.FINISHED:
             values["finished_at"] = now
+        elif new is ChannelWorkflowStatus.ACTIVE:
+            values["finished_at"] = None     # re-opened (a skipped / failed project was retried)
         res = db.execute(update(ChannelWorkflow)
                          .where(ChannelWorkflow.id == workflow_id, ChannelWorkflow.status == expect.value)
                          .values(**values))
@@ -224,7 +228,7 @@ class Orchestrator:
             if scheduled is None:
                 return _WAIT
             domain_id, job = scheduled
-            return self._reconcile(db, handler, project_id, domain_id, job, res)
+            return self._reconcile(db, handler, project_id, domain_id, job, res, wf)
         # IN_PROGRESS
         if inline:
             return _WAIT
@@ -235,9 +239,10 @@ class Orchestrator:
             if scheduled is None:
                 return _WAIT
             domain_id, job = scheduled
-        return self._reconcile(db, handler, project_id, domain_id, job, res)
+        return self._reconcile(db, handler, project_id, domain_id, job, res, wf)
 
-    def _reconcile(self, db, handler, project_id: str, domain_id: str, job: PipelineJob, res: TickResult) -> str:
+    def _reconcile(self, db, handler, project_id: str, domain_id: str, job: PipelineJob, res: TickResult,
+                   wf: ChannelWorkflow) -> str:
         """Apply what the (already linked/found) job's status means for its step."""
         if job.status == JobStatus.COMPLETED.value:
             handler.finalize(db, self.ctx, domain_id, job)
@@ -248,9 +253,32 @@ class Orchestrator:
             handler.mark_failed(db, self.ctx, domain_id, job)
             logger.info("step_failed project=%s step=%s job=%s error_code=%s", project_id, handler.step, job.id,
                         str(job.last_error_code)[:80])
+            if self._end_by_policy(db, project_id, wf, handler.step, job.last_error_code):
+                res.ended.append((project_id, handler.step, job.last_error_code))
+                return _ENDED
             res.failed.append((project_id, handler.step, job.last_error_code))
             return _FAILED
         return _WAIT  # queued / processing / waiting_capacity
+
+    def _end_by_policy(self, db, project_id: str, wf: ChannelWorkflow, step: str, code: str | None) -> bool:
+        """``failure_policy.on_permanent_error == "continue"``: a step that failed for good ends only THIS project
+        (needs_attention) instead of pausing the whole workflow. Returns True when the project was ended."""
+        status = terminal_status_for(policy_from_config(wf.config), PERMANENT)
+        if status is None:
+            return False
+        db.expire_all()
+        project = db.get(StoryProject, project_id)
+        if project is None or project.status in TERMINAL_PROJECT_STATUSES:
+            return project is not None
+        project.status = status
+        project.status_reason = str(code or "step_failed")[:64]
+        project.status_detail = {"step": step, "error_code": code}
+        project.next_attempt_at = None
+        project.updated_at = self.ctx.clock()
+        db.commit()
+        logger.info("project_ended project=%s step=%s status=%s error_code=%s", project_id, step, status,
+                    str(code)[:80])
+        return True
 
     @staticmethod
     def _is_terminal(db, project_id: str) -> bool:
@@ -298,8 +326,17 @@ class Orchestrator:
                 return res
             res.recovered = queue.recover_stale_jobs(db, now=now)
             pids = self._project_ids(db, workflow_id)
+            slots = batch_from_config(wf.config).max_active      # None = every project at once (legacy)
             for pid in pids:
+                if slots is not None:
+                    if self._position(db, pid).step is None:
+                        continue                                  # completed / skipped: takes no slot
+                    if slots <= 0:
+                        continue                                  # waits for a free slot
+                    slots -= 1
                 self._advance_project(db, pid, wf, now, res)
+                if slots is not None and self._position(db, pid).step is None:
+                    slots += 1              # finished / ended during this very tick: the next project may start now
             res.projects = {pid: self._position(db, pid) for pid in pids}
             failure = self._first_failure(res)
             if failure is not None:
@@ -402,7 +439,11 @@ class Orchestrator:
     # ------------------------------------------------------------------ explicit operator actions
 
     def _retry_project(self, db, project_id: str, wf: ChannelWorkflow, now) -> str | None:
-        """Re-arm the first non-completed step if it is FAILED. Returns the step name or None."""
+        """Re-arm the first non-completed step if it is FAILED. Returns the step name or None.
+        An ended (skipped / needs_attention) project is left alone: only ``reactivate_project`` may bring it back,
+        otherwise resume / retry would queue jobs for a project the batch already gave up on."""
+        if self._is_terminal(db, project_id):
+            return None
         for handler in self.chain:
             db.expire_all()
             view = handler.status(db, self.ctx, db.get(StoryProject, project_id))
@@ -418,6 +459,38 @@ class Orchestrator:
                                require_active=False)
             return handler.step
         return None
+
+    def reactivate_project(self, project_id: str, *, now=None) -> str | None:
+        """Operator action: bring a skipped / needs_attention project back into its workflow. Returns the step
+        that had ended it (None when the project was not ended). A job step that failed gets a fresh domain row
+        + job; the inline source step simply runs again on the next tick. A finished workflow is re-opened."""
+        now = self._now(now)
+        db = self.ctx.session_factory()
+        try:
+            project = db.get(StoryProject, project_id)
+            if project is None or project.status not in TERMINAL_PROJECT_STATUSES:
+                return None
+            if project.channel_workflow_id is None:
+                return None
+            wf = self._workflow(db, project.channel_workflow_id)
+            if wf.status in (ChannelWorkflowStatus.CANCELLED.value, ChannelWorkflowStatus.ABANDONED.value):
+                return None   # history of a cancelled workflow is kept as it is; nothing may be queued for it
+            step = (project.status_detail or {}).get("step")
+            project.status = ProjectStatus.ACTIVE.value
+            project.status_reason = None
+            project.status_detail = None
+            project.source_attempts = 0
+            project.next_attempt_at = None
+            project.updated_at = now
+            db.commit()
+            wf = self._workflow(db, wf.id)
+            self._retry_project(db, project_id, wf, now)
+            if wf.status == ChannelWorkflowStatus.FINISHED.value:
+                self._set_workflow_status(db, wf.id, ChannelWorkflowStatus.ACTIVE,
+                                          expect=ChannelWorkflowStatus.FINISHED, now=now)
+            return step
+        finally:
+            db.close()
 
     def failed_step_of(self, project_id: str) -> str | None:
         """Read-only: the name of the project's current step if (and only if) it is FAILED. Inline-step

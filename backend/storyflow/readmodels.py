@@ -788,7 +788,10 @@ class ReadModels:
         failure = self._failure(wf, project, current, cur_view, jobs.get(current) if current else None)
         state = self._state(current, cur_view, block, failure)
         if project.status in (ProjectStatus.SKIPPED.value, ProjectStatus.NEEDS_ATTENTION.value):
-            state, block, failure = project.status, None, None  # terminal batch outcome wins over step views
+            # terminal batch outcome wins over step views; needs_attention keeps the failure details
+            state, block = project.status, None
+            if project.status == ProjectStatus.SKIPPED.value:
+                failure = None
         return ProjectSnapshot(
             id=project.id, workflow_id=project.channel_workflow_id, title=project.title, slug=project.slug,
             status=project.status, state=state, current_step=current,

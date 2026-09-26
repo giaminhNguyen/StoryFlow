@@ -30,11 +30,18 @@ const OUTCOME_REASONS: Record<string, string> = {
   empty_source: "The subtitle was empty",
   subtitle_retries_exhausted: "The subtitle provider kept failing; retries used up",
   source_not_configured: "No source video is configured for this project",
+  inbox_file_missing: "The subtitle file was not found in the inbox folder",
+  task_failed: "The step kept failing",
+  invalid_output: "The AI kept producing invalid output",
+  infra_exhausted: "Infrastructure errors used up all retries",
+  runner_crashed: "The runner kept crashing",
+  timeout: "The step kept timing out",
 };
 
 export function outcomeText(p: ProjectSnapshot): string {
   const code = p.status_reason ?? "unknown";
-  return `${OUTCOME_REASONS[code] ?? code} (${code}). The rest of the batch continues.`;
+  const step = typeof p.status_detail?.step === "string" ? `${p.status_detail.step}: ` : "";
+  return `${step}${OUTCOME_REASONS[code] ?? code} (${code}). The rest of the batch continues; retry this project when the cause is fixed.`;
 }
 
 export function blockText(b: BlockInfo): string {

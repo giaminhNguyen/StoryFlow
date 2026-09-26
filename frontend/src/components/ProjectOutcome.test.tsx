@@ -36,6 +36,16 @@ describe("batch outcomes (skipped / needs attention)", () => {
     expect(outcomeText(project)).toContain("weird_code");
   });
 
+  it("names the step that ended the project and says how to bring it back", () => {
+    const project = makeProject({
+      state: "needs_attention", status: "needs_attention", status_reason: "invalid_output",
+      status_detail: { step: "story", error_code: "invalid_output" },
+    });
+    expect(outcomeText(project)).toBe(
+      "story: The AI kept producing invalid output (invalid_output). " +
+      "The rest of the batch continues; retry this project when the cause is fixed.");
+  });
+
   it("shows no outcome box for an ordinary in-progress project", () => {
     render(<ProjectCard project={makeProject()} capacity={capacity} />);
     expect(screen.queryByRole("group", { name: "Outcome" })).toBeNull();

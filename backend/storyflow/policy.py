@@ -15,6 +15,14 @@ retries or resumes it. ``skip`` / ``continue`` mark ONLY the affected project (`
 Operator errors (a missing provider install, an unreadable config) always pause: they would fail
 every item the same way, so continuing would only burn the whole batch.
 
+``batch`` (workflow config, roadmap 4.3) bounds how many projects run at once::
+
+    {"max_active": 2}    # only the first 2 unfinished projects (creation order) are advanced; None = all (legacy)
+
+Finished, skipped and needs-attention projects free their slot, so the next video starts right away and
+projects overlap across pipeline stages (one is writing a story while another is being read aloud) without
+hitting the subtitle provider for the whole list at once.
+
 Error taxonomy for the source step (``classify_source_error``)::
 
     transient   provider_blocked, provider_timeout      -> retry later with backoff (never a batch failure)
@@ -53,8 +61,11 @@ RECOMMENDED = {
 # Recommended for multi-video runs: a bad item must not stop the rest.
 RECOMMENDED_BATCH = {**RECOMMENDED, "on_no_subtitle": "skip", "on_permanent_error": "continue"}
 
+RECOMMENDED_BATCH_SETTINGS = {"max_active": 2}
+
 _MAX_RETRIES = 100
 _MAX_SECONDS = 24 * 3600
+_MAX_ACTIVE = 50
 
 
 class PolicyError(ValueError):
@@ -77,6 +88,37 @@ class FailurePolicy:
 
     def exhausted(self, attempts: int) -> bool:
         return self.subtitle_retries is not None and attempts >= self.subtitle_retries
+
+
+@dataclass(frozen=True)
+class BatchSettings:
+    max_active: int | None = None            # None = every project at once (legacy)
+
+
+def parse_batch_settings(raw) -> BatchSettings:
+    """Strict parse used when a workflow is created: unknown keys / bad values raise PolicyError."""
+    if raw is None:
+        return BatchSettings()
+    if not isinstance(raw, dict):
+        raise PolicyError("batch must be an object")
+    unknown = sorted(set(raw) - {"max_active"})
+    if unknown:
+        raise PolicyError("batch has unknown keys: " + ", ".join(str(k)[:40] for k in unknown))
+    value = raw.get("max_active")
+    if value is None:
+        return BatchSettings()
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_ACTIVE:
+        raise PolicyError(f"batch.max_active must be a whole number between 1 and {_MAX_ACTIVE}")
+    return BatchSettings(value)
+
+
+def batch_from_config(config) -> BatchSettings:
+    """Lenient read used while running: invalid stored settings degrade to the legacy default."""
+    raw = config.get("batch") if isinstance(config, dict) else None
+    try:
+        return parse_batch_settings(raw)
+    except PolicyError:
+        return BatchSettings()
 
 
 def _num(value, name, *, minimum, maximum, integer):

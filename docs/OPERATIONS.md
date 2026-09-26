@@ -109,9 +109,24 @@ One workflow can hold many videos. Send sources to `POST /api/workflows/{id}/sou
 | Retries used up, source not configured | `on_permanent_error: "pause"` (default) pauses; `"continue"` marks only that project **needs_attention**. |
 | Provider not installed / misconfigured (`provider_unavailable`) | Always pauses (it would fail every video the same way). |
 
-Skipped / needs-attention projects are shown with their reason (UI: project card; API: `state`, `status_reason`) and are
-counted in the workflow `counts`. A workflow finishes when every project is completed, skipped or needs-attention.
-Values are validated when the workflow is created (`422` with `reason: invalid_failure_policy`).
+Skipped / needs-attention projects are shown with their reason (UI: project card; API: `state`, `status_reason`,
+`status_detail.step`) and are counted in the workflow `counts`. A workflow finishes when every project is completed,
+skipped or needs-attention. Values are validated when the workflow is created (`422` with
+`reason: invalid_failure_policy`).
+
+With `on_permanent_error: "continue"` this also covers the AI / TTS steps: if `canon`, `story`, `tts` or `audio` fails
+for good (all retries used up) only that project becomes **needs_attention**; without it the whole workflow pauses.
+
+**Bringing a project back:** `POST /api/projects/{project_id}/retry` (skipped or needs-attention only; anything else is a
+`409 not_retryable`). A failed AI / TTS step gets a fresh attempt, the subtitle step simply runs again, and a workflow
+that had already finished is re-opened.
+
+### How many projects run at once (`batch`)
+
+`"batch": {"max_active": 2}` in the workflow config (default for new workflows: 2; `null` = all at once). Only the first
+N unfinished projects, in creation order (= newest video first), are advanced. When one completes, is skipped or needs
+attention, the next one starts immediately, so stages overlap (one story is being written while another is read aloud)
+while YouTube is not asked for every video at once. Channels are simply worked through in the order they were added.
 
 ### Story length
 

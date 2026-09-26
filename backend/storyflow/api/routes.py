@@ -197,6 +197,15 @@ def get_project(request: Request, project_id: PathId):
     return to_jsonable(_c(request).read.get_project(project_id))
 
 
+@router.post("/projects/{project_id}/retry")
+def retry_project(request: Request, project_id: PathId):
+    """Bring a skipped / needs_attention project back into its workflow (409 when it has not ended)."""
+    c = _c(request)
+    result = c.workflows.retry_project(project_id)
+    return {"result": to_jsonable(result), "workflow": to_jsonable(c.read.get_workflow(result.workflow_id)),
+            "project": to_jsonable(c.read.get_project(project_id))}
+
+
 # ---------------------------------------------------------------------------- runners
 
 

@@ -23,6 +23,7 @@ import functools
 import json
 import logging
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,13 +47,14 @@ from .models import (
     StoryGeneration,
     StoryProject,
     StoryVersion,
+    TERMINAL_PROJECT_STATUSES,
     TERMINAL_WORKFLOW_STATUSES,
     TTSGeneration,
     WorkflowSession,
 )
 from .orchestrator import Orchestrator
 from .pipeline import PipelineContext
-from .policy import RECOMMENDED, PolicyError, parse_failure_policy
+from .policy import RECOMMENDED, RECOMMENDED_BATCH_SETTINGS, PolicyError, parse_batch_settings, parse_failure_policy
 from .roles import Role
 
 _FRESH = {"execution_options": {"populate_existing": True}}
@@ -208,8 +210,14 @@ class WorkflowService:
             parse_failure_policy(config.get("failure_policy"))
         except PolicyError as exc:
             raise ValidationFailed(str(exc), reason="invalid_failure_policy") from None
+        try:
+            parse_batch_settings(config.get("batch"))
+        except PolicyError as exc:
+            raise ValidationFailed(str(exc), reason="invalid_batch") from None
         if "failure_policy" not in config:  # record the policy that applies (retry with backoff, then pause)
             config = {**config, "failure_policy": dict(RECOMMENDED)}
+        if "batch" not in config:  # record how many projects run at once (a batch must not hit YouTube all at once)
+            config = {**config, "batch": dict(RECOMMENDED_BATCH_SETTINGS)}
         role_preferences = self._validate_role_preferences(role_preferences)
         if client_key is not None and (not isinstance(client_key, str) or not client_key.strip()
                                        or len(client_key) > 128):
@@ -450,6 +458,65 @@ class WorkflowService:
             self._release_retry(workflow_id)
         wf = self._read(workflow_id)
         return self._result(wf, True, **({"step": step, "project_id": project_id} if project_id else {}))
+
+    # --- retry one ended project (skipped / needs_attention)
+
+    @_logged_command("retry_project")
+    def retry_project(self, project_id) -> CommandResult:
+        """Bring a ``skipped`` / ``needs_attention`` project back into its (still open) workflow.
+
+        The project goes back to ``active``; a job step that failed for good gets a fresh domain row + job (the
+        inline source step simply runs again) and a FINISHED workflow is re-opened. A project that has not ended is
+        refused (``project_not_ended``) with no state change. Concurrent calls converge: exactly one wins, the others
+        get ``project_not_ended``; duplicate work is prevented by the handlers' unique-index-guarded ``begin`` plus
+        the enqueue dedupe key.
+        """
+        db = self.ctx.session_factory()
+        try:
+            project = db.scalar(select(StoryProject).where(StoryProject.id == project_id), **_FRESH)
+            if project is None:
+                raise NotFound("project not found", reason="project_not_found", project_id=project_id)
+            if project.channel_workflow_id is None:
+                raise InvalidState("project does not belong to a workflow", reason="workflow_closed",
+                                   project_id=project_id)
+            wf = self._get(db, project.channel_workflow_id)
+            if wf.status in (_S.CANCELLED.value, _S.ABANDONED.value):
+                raise self._invalid(wf, "retry a project of", "terminal", project_id=project_id)
+            if project.status not in TERMINAL_PROJECT_STATUSES:
+                raise NotRetryable("project has not ended (it is neither skipped nor needing attention)",
+                                   reason="project_not_ended", workflow_id=wf.id, project_id=project_id,
+                                   status=project.status)
+            workflow_id = wf.id
+        finally:
+            db.close()
+
+        with self._project_lock(project_id):
+            # re-check inside the lock: a concurrent retry may already have reactivated the project
+            if not self._project_ended(project_id):
+                raise NotRetryable("project has not ended (it is neither skipped nor needing attention)",
+                                   reason="project_not_ended", workflow_id=workflow_id, project_id=project_id)
+            step = self.orchestrator.reactivate_project(project_id, now=self._now())
+        wf = self._read(workflow_id)
+        return self._result(wf, True, project_id=project_id, step=step)
+
+    _project_locks: dict = {}
+    _project_locks_guard = threading.Lock()
+
+    @classmethod
+    def _project_lock(cls, project_id: str) -> threading.Lock:
+        """Per-project in-process lock so two concurrent retries of the same project run one after the other; the
+        second then finds the project already active. Across processes the handlers' unique indexes and the enqueue
+        dedupe key still guarantee a single job."""
+        with cls._project_locks_guard:
+            return cls._project_locks.setdefault(project_id, threading.Lock())
+
+    def _project_ended(self, project_id: str) -> bool:
+        db = self.ctx.session_factory()
+        try:
+            status = db.scalar(select(StoryProject.status).where(StoryProject.id == project_id), **_FRESH)
+            return status in TERMINAL_PROJECT_STATUSES
+        finally:
+            db.close()
 
     def _read(self, workflow_id) -> ChannelWorkflow:
         db = self.ctx.session_factory()
