@@ -42,7 +42,8 @@ def test_chain_is_linear_and_0004_follows_0003():
     assert script.get_revision("0006_source_policy").down_revision == "0005_control_plane"
     assert script.get_revision("0007_source_feeds").down_revision == "0006_source_policy"
     assert script.get_revision("0008_story_reviews").down_revision == "0007_source_feeds"
-    assert script.get_heads() == ["0008_story_reviews"]
+    assert script.get_revision("0009_feed_min_duration").down_revision == "0008_story_reviews"
+    assert script.get_heads() == ["0009_feed_min_duration"]
 
 
 def test_clean_upgrade_downgrade_upgrade(monkeypatch, tmp_path):

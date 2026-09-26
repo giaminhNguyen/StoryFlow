@@ -13,7 +13,9 @@ from storyflow.artifacts import ArtifactStore
 from storyflow.errors import CapacityUnavailable, InvalidState, NotFound, ValidationFailed
 from storyflow.models import ChannelWorkflow, SourceFeed, StoryProject
 from storyflow.pipeline import PipelineContext
-from storyflow.source_service import DEFAULT_LIMIT, MAX_LIMIT, MAX_SOURCES, SourceService, SourcesResult
+from storyflow.source_service import (
+    DEFAULT_LIMIT, MAX_LIMIT, MAX_NEW_PER_CALL, MAX_SOURCES, SourceService, SourcesResult,
+)
 from storyflow.sources import FakeVideoLister, SourceError, VideoRef
 
 NOW = datetime(2026, 5, 1, 9, 0, 0)
@@ -23,7 +25,8 @@ PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLplaylist0001"
 PLAYLIST_REF = "PLplaylist0001"
 ADDED_KEYS = {"project_id", "video_id", "title", "slug", "feed_id"}
 DUPLICATE_KEYS = {"video_id", "title", "reason", "project_id"}
-FEED_KEYS = {"id", "kind", "ref", "title", "listed", "added", "known"}
+FEED_KEYS = {"id", "kind", "ref", "title", "listed", "added", "known", "window_full", "partial", "order"}
+INBOX_FILES = ("a.txt", "b.srt", "c.vtt", "my story.txt", "x.txt")
 
 
 def vid(i: int) -> str:
@@ -60,10 +63,20 @@ def lister():
 
 
 @pytest.fixture
-def make_ctx(session_factory, tmp_path, clock):
+def inbox(tmp_path):
+    """An inbox folder holding the small subtitle files the ``inbox:`` tests refer to."""
+    folder = tmp_path / "inbox"
+    folder.mkdir()
+    for name in INBOX_FILES:
+        (folder / name).write_text("Một dòng lời thoại.\nDòng hai.", encoding="utf-8")
+    return folder
+
+
+@pytest.fixture
+def make_ctx(session_factory, tmp_path, clock, inbox):
     def _make(video_lister=None):
         return PipelineContext(session_factory=session_factory, store=ArtifactStore(tmp_path / "artifacts"),
-                               subtitle_client=None, clock=clock, video_lister=video_lister, inbox_dir=None)
+                               subtitle_client=None, clock=clock, video_lister=video_lister, inbox_dir=inbox)
     return _make
 
 
@@ -147,7 +160,7 @@ def test_invalid_source_reports_its_index_and_creates_nothing(db, svc, lister, s
     assert state(db, wf.id) == before and lister.calls == []
 
 
-@pytest.mark.parametrize("limit", [0, -1, MAX_LIMIT + 1, True, False, "5", 2.5])
+@pytest.mark.parametrize("limit", [None, 0, -1, MAX_LIMIT + 1, True, False, "5", 2.5])   # "everything" is never legal
 def test_invalid_limit(db, svc, limit):
     wf = make_wf(db)
     before = state(db, wf.id)
@@ -262,20 +275,19 @@ def test_channel_expansion_keeps_newest_first_and_uses_default_limit(db, svc, li
     (report,) = r.feeds
     assert set(report) == FEED_KEYS
     assert report == {"id": feed.id, "kind": "channel", "ref": CHANNEL_URL, "title": "Chan Title",
-                      "listed": 10, "added": 10, "known": 10}
+                      "listed": 10, "added": 10, "known": 10, "window_full": True, "partial": False,
+                      "order": "newest_first"}                         # 10 of 30 asked for and returned: more exist
     assert len(r.added) == 10 and set(r.added[0]) == ADDED_KEYS and r.added[0]["feed_id"] == feed.id
 
 
-def test_explicit_limit_and_unlimited(db, svc, lister):
+def test_explicit_limit_is_passed_to_the_lister_and_kept_on_the_feed(db, svc, lister):
     wf = make_wf(db)
     assert len(svc.add_sources(wf.id, [CHANNEL_URL], limit=3).added) == 3 and lister.calls[-1][2] == 3
+    (feed,) = feeds(db, wf.id)
+    assert feed.limit_count == 3
     wf2 = make_wf(db, name="wf2")
-    other = FakeVideoLister({CHANNEL_URL: ("c", videos(30, start=4000))})  # not seen by wf
-    svc2 = SourceService(dataclasses.replace(svc.ctx, video_lister=other))
-    assert len(svc2.add_sources(wf2.id, [CHANNEL_URL], limit=None).added) == 30 and other.calls == [
-        ("channel", CHANNEL_URL, None)]
-    (feed,) = feeds(db, wf2.id)
-    assert feed.limit_count is None
+    r = svc.add_sources(wf2.id, [OTHER_URL], limit=MAX_LIMIT)            # the largest legal request
+    assert len(r.added) == 5 and r.feeds[0]["window_full"] is False      # fewer than asked for: nothing is cut off
 
 
 def test_second_call_reuses_the_feed_and_only_adds_new_videos(db, svc, clock):
@@ -445,7 +457,7 @@ def test_reprocess_still_collapses_repeats_inside_one_request(db, svc):
 # --- local inbox files ---------------------------------------------------------------------------
 
 
-def test_local_inbox_source(db, svc, lister):
+def test_local_inbox_source(db, svc, lister):   # the inbox fixture holds the files
     wf = make_wf(db)
     r = svc.add_sources(wf.id, ["inbox:my story.txt"], languages=["vi"])
     (p,) = projects(db, wf.id)
@@ -572,27 +584,30 @@ def test_a_failing_later_source_creates_nothing(db, svc):
 
 def test_sync_adds_only_new_videos_and_moves_the_cursor(db, svc, lister, clock):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(5))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=5, languages=["vi"])
-    lister.store[CHANNEL_URL] = ("Chan Title", videos(2, start=900) + videos(30))   # two new uploads on top
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2, start=900) + videos(5))    # two new uploads on top
     clock.advance(600)
     r = svc.sync_feeds(wf.id)
-    assert lister.calls[-1] == ("channel", CHANNEL_URL, 5)                # the feed's own limit
+    assert lister.calls[-1] == ("channel", CHANNEL_URL, 50)               # a wider window than the first add (5 x 3 < 50)
     assert [a["video_id"] for a in r.added] == [vid(900), vid(901)]
-    assert [d["video_id"] for d in r.duplicates] == [vid(i) for i in range(3)]
+    assert [d["video_id"] for d in r.duplicates] == [vid(i) for i in range(5)]
     assert {d["reason"] for d in r.duplicates} == {"in_workflow"}
     (feed,) = feeds(db, wf.id)
     assert feed.known_count == 7 and feed.last_scanned_at == NOW + timedelta(seconds=600) and feed.status == "active"
+    assert feed.limit_count == 5                                          # the first-add limit is not overwritten
     (report,) = r.feeds
-    assert report == {"id": feed.id, "kind": "channel", "ref": CHANNEL_URL, "title": "Chan Title", "listed": 5,
-                      "added": 2, "known": 7}
+    assert report == {"id": feed.id, "kind": "channel", "ref": CHANNEL_URL, "title": "Chan Title", "listed": 7,
+                      "added": 2, "known": 7, "window_full": False, "partial": False, "order": "newest_first"}
     assert r.changed and r.errors == [] and r.reopened is False
     new = [p for p in projects(db, wf.id) if p.video_id in (vid(900), vid(901))]
     assert all(p.source_config["languages"] == ["vi"] and p.feed_id == feed.id for p in new)   # feed languages
     assert [p.video_id for p in projects(db, wf.id)][-2:] == [vid(900), vid(901)]              # run after the old ones
 
 
-def test_sync_with_nothing_new_changes_nothing(db, svc, clock):
+def test_sync_with_nothing_new_changes_nothing(db, svc, lister, clock):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(3))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=3)
     r = svc.sync_feeds(wf.id)
     assert r.changed is False and r.added == [] and len(r.duplicates) == 3 and r.errors == []
@@ -618,12 +633,13 @@ def test_sync_needs_a_lister_when_there_are_feeds(db, svc, make_ctx):
 
 def test_sync_isolates_a_failing_feed_and_recovers_later(db, svc, lister, clock):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2))
     svc.add_sources(wf.id, [CHANNEL_URL, OTHER_URL], limit=2)
     good_ref, bad_ref = CHANNEL_URL, OTHER_URL
-    lister.store[good_ref] = ("Chan Title", videos(4))                     # two more on the good feed
+    lister.store[good_ref] = ("Chan Title", videos(2))                     # nothing new on the good feed
     lister.store[bad_ref] = SourceError("lister_failed", "channel gone")
     r = svc.sync_feeds(wf.id)
-    assert r.added == []                                                   # limit 2: its newest 2 are already known
+    assert r.added == []                                                   # the two known videos are all it lists
     by_ref = {f.ref: f for f in feeds(db, wf.id)}
     assert by_ref[bad_ref].status == "error" and "channel gone" in by_ref[bad_ref].last_error
     assert by_ref[good_ref].status == "active"
@@ -639,8 +655,9 @@ def test_sync_isolates_a_failing_feed_and_recovers_later(db, svc, lister, clock)
 
 def test_sync_new_videos_on_the_good_feed_while_another_feed_fails(db, svc, lister):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2))
     svc.add_sources(wf.id, [CHANNEL_URL, OTHER_URL], limit=2)
-    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=700) + videos(30))
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=700) + videos(2))
     lister.store[OTHER_URL] = SourceError("lister_timeout", "slow")
     r = svc.sync_feeds(wf.id)
     assert [a["video_id"] for a in r.added] == [vid(700)]
@@ -650,6 +667,7 @@ def test_sync_new_videos_on_the_good_feed_while_another_feed_fails(db, svc, list
 
 def test_sync_when_every_feed_fails_changes_no_projects(db, svc, lister):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=2)
     lister.store[CHANNEL_URL] = SourceError("lister_failed", "blocked")
     r = svc.sync_feeds(wf.id)
@@ -658,19 +676,22 @@ def test_sync_when_every_feed_fails_changes_no_projects(db, svc, lister):
     assert len(projects(db, wf.id)) == 2
 
 
-def test_sync_respects_a_feed_without_limit(db, svc, lister):
+def test_sync_of_a_legacy_feed_without_a_limit_lists_the_widest_window(db, svc, lister):
     wf = make_wf(db)
-    svc.add_sources(wf.id, [OTHER_URL], limit=None)
+    svc.add_sources(wf.id, [OTHER_URL], limit=5)
+    db.execute(update(SourceFeed).where(SourceFeed.channel_workflow_id == wf.id).values(limit_count=None))  # pre-0009 row
+    db.commit()
     svc.sync_feeds(wf.id)
-    assert lister.calls[-1] == ("channel", OTHER_URL, None)
+    assert lister.calls[-1] == ("channel", OTHER_URL, MAX_LIMIT)
 
 
 def test_sync_skips_videos_processed_in_other_workflows(db, svc, lister):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=2)
     other = make_wf(db, name="other")
     known = add_project(db, other.id, vid(800))
-    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=800) + videos(30))
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=800) + videos(2))
     r = svc.sync_feeds(wf.id)
     assert r.added == [] and r.duplicates[0] == {"video_id": vid(800), "title": "Title 800",
                                                   "reason": "already_processed", "project_id": known.id}
@@ -678,13 +699,14 @@ def test_sync_skips_videos_processed_in_other_workflows(db, svc, lister):
 
 def test_sync_reopens_a_finished_workflow_only_when_new_videos_appear(db, svc, lister):
     wf = make_wf(db)
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(2))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=2)
     db.execute(update(ChannelWorkflow).where(ChannelWorkflow.id == wf.id).values(status="finished", finished_at=NOW))
     db.commit()
     quiet = svc.sync_feeds(wf.id)
     assert quiet.changed is False and quiet.reopened is False and quiet.status == "finished"
     assert fresh(db, ChannelWorkflow, wf.id).status == "finished"
-    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=950) + videos(30))
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=950) + videos(2))
     r = svc.sync_feeds(wf.id)
     assert r.reopened is True and r.status == "active" and [a["video_id"] for a in r.added] == [vid(950)]
     row = fresh(db, ChannelWorkflow, wf.id)
@@ -693,8 +715,9 @@ def test_sync_reopens_a_finished_workflow_only_when_new_videos_appear(db, svc, l
 
 def test_sync_keeps_a_paused_workflow_paused(db, svc, lister):
     wf = make_wf(db, status="paused")
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(1))
     svc.add_sources(wf.id, [CHANNEL_URL], limit=1)
-    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=960) + videos(30))
+    lister.store[CHANNEL_URL] = ("Chan Title", videos(1, start=960) + videos(1))
     r = svc.sync_feeds(wf.id)
     assert r.status == "paused" and r.reopened is False and len(r.added) == 1
 
@@ -706,7 +729,8 @@ def test_result_is_a_frozen_dataclass_with_stable_fields(db, svc):
     wf = make_wf(db)
     r = svc.add_sources(wf.id, [vid(1), CHANNEL_URL], limit=1)
     assert [f.name for f in dataclasses.fields(SourcesResult)] == [
-        "workflow_id", "status", "changed", "added", "duplicates", "feeds", "errors", "reopened"]
+        "workflow_id", "status", "changed", "added", "duplicates", "feeds", "errors", "reopened", "truncated",
+        "not_added", "duplicates_count", "warnings"]
     with pytest.raises(dataclasses.FrozenInstanceError):
         r.changed = False
     assert isinstance(r.changed, bool) and isinstance(r.reopened, bool)

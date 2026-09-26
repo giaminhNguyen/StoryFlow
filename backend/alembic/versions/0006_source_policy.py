@@ -32,7 +32,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("story_projects") as batch:
+    # native DROP COLUMN (no table copy): recreating story_projects would fight the FKs of every child table
+    with op.batch_alter_table("story_projects", recreate="never") as batch:
         batch.drop_column("status_detail")
         batch.drop_column("status_reason")
         batch.drop_column("next_attempt_at")

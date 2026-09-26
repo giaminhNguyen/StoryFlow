@@ -27,6 +27,7 @@ from storyflow.subtitles import (
     LanguageUnavailable,
     ProviderTimeout,
     ProviderUnavailable,
+    SubtitleFetchFailed,
     SubtitlesUnavailable,
 )
 
@@ -125,7 +126,8 @@ def run_worker(op, request, python=sys.executable):
 
 
 @pytest.mark.parametrize("video_id,error", [
-    ("blocked", "blocked"), ("nosub", "no_subtitle"), ("lang", "language_unavailable"), ("boom", "internal"),
+    ("blocked", "blocked"), ("nosub", "no_subtitle"), ("lang", "language_unavailable"),
+    ("boom", "subtitle_failed"),   # an unexpected upstream error is a per-video failure, not an operator fault
     ("net", "network")])
 def test_worker_error_encoding_exit_zero(upstream, video_id, error):
     code, out = run_worker("fetch", {"backend_dir": str(upstream), "video_id": video_id})
@@ -164,7 +166,7 @@ def test_worker_does_not_write_into_upstream_dir(upstream):
 
 @pytest.mark.parametrize("video_id,exc", [
     ("blocked", BlockedByProvider), ("nosub", SubtitlesUnavailable), ("lang", LanguageUnavailable),
-    ("boom", ProviderUnavailable), ("crash", ProviderUnavailable),
+    ("boom", SubtitleFetchFailed), ("crash", ProviderUnavailable),
     ("net", ProviderTimeout)])  # transient network error => retried later, not an operator failure
 def test_client_maps_errors_without_paths(upstream, video_id, exc):
     client = SubprocessSubtitleClient(cfg(upstream))

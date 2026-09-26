@@ -12,21 +12,24 @@ orchestrator and the read models. Contract (shared with the real runner in ``int
 
     job kind story_review, role story_writer, dedupe key ``review:<review_id>``
     inputs   {"project_id", "source_artifact", "canon_artifact", "story_artifact", "story_version_id",
-              "review_id", "round_number", "revise": bool, "target_length": int | None}
+              "review_id", "round_number", "revise": bool, "target_length": int | None (words of the reviewed
+              story), "min_words": int | None (floor a revised story must reach)}
     outputs  ["projects/<pid>/review/<review_id>/review.json"]
              + ["projects/<pid>/review/<review_id>/story_revised.md"]   (only when revise)
     review.json = {"version": 1, "verdict": "approve" | "revise", "summary": str,
                    "issues": [{"aspect": "canon|logic|style|length|other", "severity": "low|medium|high",
                                "note": str}]}
 
-Output problems (bad JSON, unknown verdict, a revision that is missing or shorter than 85% of the reviewed story)
-are caught INSIDE the dispatcher path (``validate_review_output``): they become business failures with the usual
-bounded retry, so ``finalize`` only ever sees valid output.
+Output problems (bad JSON, unknown verdict, a revision that is missing, shorter than ``min_words`` = max(95% of the
+reviewed story, 85% of the ORIGINAL story target so revisions cannot ratchet the length down), ends mid-sentence or
+smuggles the ``=== REVISED STORY ===`` marker) are caught INSIDE the dispatcher path (``validate_review_output``):
+they become business failures with the usual bounded retry, so ``finalize`` only ever sees valid output.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import PurePosixPath
 
 from sqlalchemy import select, update
@@ -34,7 +37,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .agents import AgentRunner, CRASH, TIMEOUT, _CrashSentinel
 from .artifacts import ArtifactStore, PathTraversalError
-from .models import CanonAnalysis, DomainStatus, StoryReview, StoryVersion, VersionStatus, uid
+from .models import CanonAnalysis, DomainStatus, StoryGeneration, StoryReview, StoryVersion, VersionStatus, uid
 from .pipeline import JobSpec, StepStatus, StepView, workflow_config
 from .presets import review_from_config
 from .protocol import ResultCode, RunnerResult, TaskPacket
@@ -61,6 +64,12 @@ VERDICTS = ("approve", "revise")
 MAX_SUMMARY_CHARS = 2000
 MAX_ISSUES = 50
 MAX_NOTE_CHARS = 1000
+
+REVISED_DELIMITER = "=== REVISED STORY ==="
+REVISED_OF_REVIEWED = 0.95        # a revision keeps at least this share of the reviewed story ...
+REVISED_OF_ORIGINAL = 0.85        # ... and of the ORIGINAL story target (the floor never compounds downwards)
+# A finished story ends with sentence punctuation, a closing quote / bracket or a markdown closer.
+_TERMINAL_CHARS = frozenset(".!?\u2026\"'\u201d\u2019\u00bb)]*_`~\u3002\uff01\uff1f\u300d\u300f\uff09")
 
 
 def review_path(project_id: str, review_id: str) -> str:
@@ -104,6 +113,23 @@ def validate_review(obj) -> str | None:
             return f"review.issues[{i}].note must be a non-empty string"
         if len(note) > MAX_NOTE_CHARS:
             return f"review.issues[{i}].note is longer than {MAX_NOTE_CHARS} characters"
+    return None
+
+
+def revision_problem(text: str, store_root: str | None, *, min_words=None, target_length=None) -> str | None:
+    """None when a REVISED story is acceptable, else a short error message. ``min_words`` (the job's floor)
+    replaces the old 85%-of-``target_length`` rule when present."""
+    floor = min_words if isinstance(min_words, int) and not isinstance(min_words, bool) and min_words > 0 else None
+    problem = check_story_text(text, store_root, None if floor else target_length)
+    if problem:
+        return problem
+    words = len(text.split())
+    if floor and words < floor:
+        return f"revised story is too short ({words} words, at least {floor} required)"
+    if any(line.strip() == REVISED_DELIMITER for line in text.splitlines()):
+        return "revised story contains the revised-story delimiter line"
+    if text.rstrip()[-1] not in _TERMINAL_CHARS:
+        return "revised story ends abruptly (no closing punctuation): it looks truncated"
     return None
 
 
@@ -154,8 +180,9 @@ def validate_review_output(packet: TaskPacket, store: ArtifactStore) -> str | No
             return "story_revised.md was not produced"
         except UnicodeDecodeError:
             return "story_revised.md is not valid UTF-8"
-        target = (packet.task_config or {}).get("target_length")
-        return check_story_text(text, str(store.root), target)
+        cfg = packet.task_config or {}
+        return revision_problem(text, str(store.root), min_words=cfg.get("min_words"),
+                                target_length=cfg.get("target_length"))
     return None   # approve: a stray story_revised.md is ignored (never read, never registered)
 
 
@@ -192,18 +219,32 @@ class ReviewStep(_JobStep):
         version = _latest_version(db, project.id)
         if version is None:
             return StepView(StepStatus.NOT_STARTED)
+        settings = review_from_config(workflow_config(db, project))
         rows = self._reviews(db, project.id)
         view = self._pick([r for r in rows if r.story_version_id == version.id])
         if view.status is not StepStatus.NOT_STARTED:
+            if view.status is StepStatus.FAILED and settings.on_failure == "skip":
+                return StepView(StepStatus.COMPLETED)   # advisory review: the failed round stays visible, TTS goes on
             return view
         completed = sum(1 for r in rows if r.status == DomainStatus.COMPLETED.value)
-        if completed >= review_from_config(workflow_config(db, project)).max_rounds:
+        if completed >= settings.max_rounds:
             return StepView(StepStatus.COMPLETED)   # rounds used up: the last revision is accepted unreviewed
         return StepView(StepStatus.NOT_STARTED)
 
+    @staticmethod
+    def _floor(db, version: StoryVersion) -> tuple[int | None, int | None]:
+        """(words of the reviewed story, min_words a revised story must reach)."""
+        reviewed = version.word_count or len((version.content or "").split())
+        gen = db.get(StoryGeneration, version.story_generation_id) if version.story_generation_id else None
+        original = (gen.config or {}).get("target_length") if gen is not None else None
+        original = original if isinstance(original, int) and not isinstance(original, bool) and original > 0 else 0
+        floor = max(math.ceil(REVISED_OF_REVIEWED * reviewed), math.ceil(REVISED_OF_ORIGINAL * original))
+        return (reviewed or None), (floor or None)
+
     def begin(self, db, ctx, project):
         """None without a story version, when this version is already reviewed, or when the rounds are used
-        up. A failed review never blocks: begin creates a fresh one."""
+        up. A failed review blocks by default: begin creates a fresh one (retry); with ``review.on_failure``
+        "skip" it is advisory and never retried."""
         version = _latest_version(db, project.id)
         if version is None or not version.content_path:
             return None
@@ -227,12 +268,17 @@ class ReviewStep(_JobStep):
             if live:
                 review = live[0]
                 break
+            if settings.on_failure == "skip" and any(
+                    r.story_version_id == version.id and r.status in (DomainStatus.FAILED.value,
+                                                                      DomainStatus.CANCELLED.value) for r in rows):
+                return None            # advisory review that failed: never retried, TTS goes on
             now = ctx.clock()
+            reviewed_words, min_words = self._floor(db, version)
             candidate = StoryReview(
                 story_project_id=project.id, story_version_id=version.id, round_number=len(completed) + 1,
                 status=DomainStatus.QUEUED.value,
                 config={"revise": settings.revise, "max_rounds": settings.max_rounds,
-                        "target_length": version.word_count or len((version.content or "").split()) or None},
+                        "target_length": reviewed_words, "min_words": min_words},
                 created_at=now, updated_at=now)
             db.add(candidate)
             try:
@@ -256,10 +302,10 @@ class ReviewStep(_JobStep):
                            "canon_artifact": canon_path(project.id, canon.id),
                            "story_artifact": version.content_path, "story_version_id": version.id,
                            "review_id": review.id, "round_number": review.round_number, "revise": revise,
-                           "target_length": cfg.get("target_length")},
+                           "target_length": cfg.get("target_length"), "min_words": cfg.get("min_words")},
                 "outputs": outputs,
                 "task_config": {"step": STEP, "review_id": review.id, "revise": revise,
-                                "target_length": cfg.get("target_length")},
+                                "target_length": cfg.get("target_length"), "min_words": cfg.get("min_words")},
             })
         return review.id, spec
 
@@ -290,7 +336,8 @@ class ReviewStep(_JobStep):
                 return self._fail(db, ctx, domain_id, "missing_output", "story_revised.md not found")
             except UnicodeDecodeError:
                 return self._fail(db, ctx, domain_id, "invalid_story", "story_revised.md is not valid UTF-8")
-            problem = check_story_text(text, str(ctx.store.root), cfg.get("target_length"))
+            problem = revision_problem(text, str(ctx.store.root), min_words=cfg.get("min_words"),
+                                       target_length=cfg.get("target_length"))
             if problem:
                 return self._fail(db, ctx, domain_id, "invalid_story", problem)
         for _ in range(_MAX_TRIES):
@@ -408,4 +455,4 @@ class FakeReviewRunner(AgentRunner):
 
 
 __all__ = ["FakeReviewRunner", "REVIEW_VALIDATORS", "ReviewStep", "review_path", "revised_story_path",
-           "validate_review", "validate_review_output"]
+           "revision_problem", "validate_review", "validate_review_output"]

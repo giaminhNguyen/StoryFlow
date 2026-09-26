@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ApiClient, ApiError, BackendUnavailableError } from "../api/client";
 import type { ProjectSnapshot } from "../api/types";
@@ -142,5 +142,28 @@ describe("ProjectDetailPage final audio", () => {
     render(<ProjectDetailPage projectId="p1" client={c} />);
     expect(await screen.findByText(/chunks registered/)).toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Final audio" })).toBeNull();
+  });
+});
+
+describe("ProjectDetailPage final audio load failure", () => {
+  it("explains a player that cannot load the (very long) file and keeps the download link", async () => {
+    const done = makeCompletedProject();
+    const project = { ...done, audio: { ...done.audio!, final_path: "projects/p1/audio/t1/run-001/final.wav" } };
+    const c = fakeClient(async () => project);
+    render(<ProjectDetailPage projectId="p1" client={c} />);
+    const group = await screen.findByRole("group", { name: "Final audio" });
+    expect(within(group).queryByRole("alert")).toBeNull();
+    fireEvent.error(within(group).getByLabelText("Full audio"));
+    expect(await within(group).findByRole("alert")).toHaveTextContent("The audio could not be loaded; use Download.");
+    expect(within(group).getByRole("link", { name: "Download" })).toHaveAttribute(
+      "href", "http://x/api/artifacts/projects/p1/audio/t1/run-001/final.wav");
+  });
+
+  it("shows no error while the audio is fine", async () => {
+    const done = makeCompletedProject();
+    const project = { ...done, audio: { ...done.audio!, final_path: "projects/p1/audio/t1/run-001/final.wav" } };
+    render(<ProjectDetailPage projectId="p1" client={fakeClient(async () => project)} />);
+    const group = await screen.findByRole("group", { name: "Final audio" });
+    expect(within(group).queryByText(/could not be loaded/)).toBeNull();
   });
 });

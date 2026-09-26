@@ -92,7 +92,7 @@ export function makeWorkflow(over: Partial<WorkflowSnapshot> = {}): WorkflowSnap
 
 export function makeHealth(over: Partial<Health> = {}): Health {
   return {
-    status: "ok", db: { ok: true, schema_revision: "0008_story_reviews", at_head: true },
+    status: "ok", db: { ok: true, schema_revision: "0009_feed_min_duration", at_head: true },
     runtime: { mode: "embedded", running: true, iteration: 1, errors: 0 },
     runners: { registered: 1, assigned: 0, ready: 1, offline: 0 }, demo: { video_id: "demo-video" },
     version: "0.6.0", ...over,

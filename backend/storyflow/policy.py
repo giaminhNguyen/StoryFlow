@@ -13,7 +13,10 @@ retries or resumes it. ``skip`` / ``continue`` mark ONLY the affected project (`
 ``needs_attention``) and let the rest of the batch carry on.
 
 Operator errors (a missing provider install, an unreadable config) always pause: they would fail
-every item the same way, so continuing would only burn the whole batch.
+every item the same way, so continuing would only burn the whole batch. The same holds for job steps:
+``continue`` only ends a project for an error that belongs to THAT item; systemic codes (``SYSTEMIC_CODES``:
+infra_exhausted, quota_exhausted, auth_error, all_agents_unavailable, ...) pause the workflow, and a circuit
+breaker pauses it too once ``BREAKER_LIMIT`` projects already ended with the very same reason.
 
 ``batch`` (workflow config, roadmap 4.3) bounds how many projects run at once::
 
@@ -37,6 +40,7 @@ Pure functions only: nothing here touches the database.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .models import ProjectStatus
@@ -50,7 +54,9 @@ _TRANSIENT_CODES = frozenset({"provider_blocked", "provider_timeout"})
 _NO_SUBTITLE_CODES = frozenset({"subtitles_unavailable", "language_unavailable", "empty_source"})
 _OPERATOR_CODES = frozenset({"provider_unavailable"})
 
-# Recommended values written into new workflows (the engine default stays "legacy": pause, no backoff).
+# Recommended values written into new workflows (the engine default stays "legacy": pause, no backoff). A policy
+# given at creation is merged over these, so a partial policy such as {"on_no_subtitle": "skip"} still gets the
+# retry limit and the backoff; an explicit null (e.g. "subtitle_retries": null) is the legacy opt-out.
 RECOMMENDED = {
     "subtitle_retries": 5,
     "retry_base_seconds": 30,
@@ -58,8 +64,16 @@ RECOMMENDED = {
     "on_no_subtitle": "pause",
     "on_permanent_error": "pause",
 }
-# Recommended for multi-video runs: a bad item must not stop the rest.
-RECOMMENDED_BATCH = {**RECOMMENDED, "on_no_subtitle": "skip", "on_permanent_error": "continue"}
+
+# Job-step failure codes that say the MACHINERY is broken (they would hit every project): ``continue`` never ends a
+# project for these, the workflow pauses instead. Anything else is an error of that item (bad output, task failed).
+SYSTEMIC_CODES = frozenset({
+    "infra_exhausted", "lease_expired", "runner_crashed", "timeout", "transient_failure", "rate_limited",
+    "quota_exhausted", "auth_error", "all_agents_unavailable", "cancelled",
+    "cli_not_found", "spawn_failed", "cli_failed", "provider_unavailable", "provider_blocked", "provider_timeout",
+    "voice_not_found", "model_load", "import_error", "oom", "io_error", "disk_full",
+})
+BREAKER_LIMIT = 3      # projects already ended (needs_attention) with the same reason before the workflow pauses
 
 RECOMMENDED_BATCH_SETTINGS = {"max_active": 2}
 
@@ -81,10 +95,12 @@ class FailurePolicy:
     on_permanent_error: str = "pause"
 
     def backoff_seconds(self, attempts: int) -> float:
-        """Delay before the retry that follows the ``attempts``-th consecutive transient failure."""
+        """Delay before the retry that follows the ``attempts``-th consecutive transient failure (never capped
+        below the base delay)."""
         if self.retry_base_seconds <= 0 or attempts < 1:
             return 0.0
-        return float(min(self.retry_base_seconds * (2 ** min(attempts - 1, 30)), self.retry_max_seconds))
+        cap = max(self.retry_max_seconds, self.retry_base_seconds)
+        return float(min(self.retry_base_seconds * (2 ** min(attempts - 1, 30)), cap))
 
     def exhausted(self, attempts: int) -> bool:
         return self.subtitle_retries is not None and attempts >= self.subtitle_retries
@@ -121,8 +137,15 @@ def batch_from_config(config) -> BatchSettings:
         return BatchSettings()
 
 
+def _finite(value) -> bool:
+    try:
+        return math.isfinite(value)
+    except OverflowError:      # an int too large for a float
+        return False
+
+
 def _num(value, name, *, minimum, maximum, integer):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not _finite(value):
         raise PolicyError(f"failure_policy.{name} must be a number")
     if integer and int(value) != value:
         raise PolicyError(f"failure_policy.{name} must be a whole number")
@@ -151,6 +174,8 @@ def parse_failure_policy(raw) -> FailurePolicy:
     if "retry_max_seconds" in raw:
         kw["retry_max_seconds"] = _num(raw["retry_max_seconds"], "retry_max_seconds", minimum=0,
                                        maximum=_MAX_SECONDS, integer=False)
+    if "retry_base_seconds" in kw and "retry_max_seconds" in kw and kw["retry_max_seconds"] < kw["retry_base_seconds"]:
+        raise PolicyError("failure_policy.retry_max_seconds must not be smaller than retry_base_seconds")
     if "on_no_subtitle" in raw:
         if raw["on_no_subtitle"] not in ON_NO_SUBTITLE:
             raise PolicyError("failure_policy.on_no_subtitle must be one of: " + ", ".join(ON_NO_SUBTITLE))
@@ -181,6 +206,19 @@ def classify_source_error(code: str | None) -> str:
     if code in _OPERATOR_CODES:
         return OPERATOR
     return PERMANENT
+
+
+def is_systemic_error(code: str | None) -> bool:
+    """True for a job-step failure code that would hit every project (see ``SYSTEMIC_CODES``)."""
+    return (code or "").lower() in SYSTEMIC_CODES
+
+
+def with_recommended(policy):
+    """The policy stored for a new workflow: a dict is merged over RECOMMENDED (given keys win, an explicit null
+    stays null = legacy opt-out); anything else is returned unchanged (None = legacy, invalid = rejected earlier)."""
+    if isinstance(policy, dict):
+        return {**RECOMMENDED, **policy}
+    return policy
 
 
 def terminal_status_for(policy: FailurePolicy, category: str) -> str | None:

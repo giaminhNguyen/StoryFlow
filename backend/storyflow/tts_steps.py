@@ -46,8 +46,11 @@ ArtifactStore.write (temp + fsync + atomic promote); completed output is never o
 import hashlib
 import io
 import json
+import logging
+import os
 import re
 import struct
+import tempfile
 import wave
 from collections import deque
 from functools import lru_cache
@@ -480,7 +483,7 @@ class AudioStep(StepHandler):
         gen = db.get(AudioGeneration, domain_id, populate_existing=True)
         now = ctx.clock()
         if have >= set(range(1, total + 1)):
-            assemble_final_audio(ctx.store, gen.store_dir, total)
+            ensure_final_audio(ctx.store, gen.store_dir, total)
             gen.status = DomainStatus.COMPLETED.value
             gen.chunk_count = total
             gen.error_code = gen.error_message = None
@@ -500,38 +503,92 @@ class AudioStep(StepHandler):
 
 FINAL_AUDIO_NAME = "final.wav"
 CHUNK_GAP_SECONDS = 0.3
+_COPY_FRAMES = 65536          # frames copied per read: memory stays constant however long the story is
+
+logger = logging.getLogger(__name__)
+_ABS_PATH = re.compile(r"[A-Za-z]:[\\/][^\s'\"]*")
+
+
+def _reason(exc: BaseException) -> str:
+    """Short, path-free description of why the final audio could not be built (for the log)."""
+    text = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+    return f"{type(exc).__name__}: {_ABS_PATH.sub('<path>', str(text))}"[:160]
 
 
 def assemble_final_audio(store: ArtifactStore, store_dir: str, total: int) -> str | None:
-    """Concatenate ``0001.wav`` .. ``NNNN.wav`` into one ``final.wav`` next to them (0.3 s silence between).
+    """Join ``0001.wav`` .. ``NNNN.wav`` into one ``final.wav`` next to them (0.3 s silence between chunks).
 
-    Best effort: the chunks stay the source of truth, so a missing/odd chunk or an I/O error only
-    means there is no final file (returns None) and never fails the audio step. Idempotent.
+    STREAMED: every chunk header is checked first (nothing is written if the formats differ), then the frames are
+    copied chunk by chunk into a temp file in the destination directory, fsynced and ``os.replace``d into place,
+    so memory stays constant for a story of any length and a crash / error never leaves a half-written
+    ``final.wav`` (nor a stray temp file). Best effort: the chunks stay the source of truth, so a missing/odd chunk
+    or an I/O error only means there is no final file (returns None, with a warning in the log) and never fails
+    the audio step. Idempotent.
     """
+    if total < 1:
+        return None
+    dest_rel = f"{store_dir}/{FINAL_AUDIO_NAME}"
+    tmp = None
     try:
-        params, frames = None, []
-        for i in range(1, total + 1):
-            with wave.open(str(store.resolve(f"{store_dir}/{i:04d}.wav")), "rb") as w:
+        paths = [store.resolve(f"{store_dir}/{i:04d}.wav") for i in range(1, total + 1)]
+        params = None
+        for path in paths:                                   # pass 1: headers only
+            with wave.open(str(path), "rb") as w:
                 p = (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getcomptype())
-                if params is None:
-                    params = p
-                elif p != params:
-                    return None
-                frames.append(w.readframes(w.getnframes()))
-        if params is None:
-            return None
+            if params is None:
+                params = p
+            elif p != params:
+                logger.warning("final audio not built for %s: the chunks differ in audio format", store_dir)
+                return None
         channels, width, rate, _ = params
         # unsigned 8-bit PCM is centred on 0x80; 16-bit PCM on 0x00
         silence = bytes([0x80 if width == 1 else 0]) * (int(rate * CHUNK_GAP_SECONDS) * channels * width)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as out:
+        dest = store.resolve(dest_rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-", suffix=".wav")
+        os.close(fd)
+        with wave.open(tmp, "wb") as out:                    # pass 2: stream the frames
             out.setnchannels(channels)
             out.setsampwidth(width)
             out.setframerate(rate)
-            out.writeframes(silence.join(frames))
-        return store.write(f"{store_dir}/{FINAL_AUDIO_NAME}", buf.getvalue())
-    except (OSError, EOFError, wave.Error, ValueError):
+            for i, path in enumerate(paths):
+                if i:
+                    out.writeframes(silence)
+                with wave.open(str(path), "rb") as chunk:
+                    while True:
+                        data = chunk.readframes(_COPY_FRAMES)
+                        if not data:
+                            break
+                        out.writeframes(data)
+        with open(tmp, "r+b") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        tmp = None
+        return dest_rel
+    except (OSError, EOFError, wave.Error, ValueError, struct.error) as exc:
+        logger.warning("final audio not built for %s: %s", store_dir, _reason(exc))
         return None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def ensure_final_audio(store: ArtifactStore, store_dir: str, total: int) -> str | None:
+    """``final.wav`` for the run: kept when it is at least as new as every chunk, else (re)built. Returns the
+    relative path, or None when it cannot be built."""
+    dest_rel = f"{store_dir}/{FINAL_AUDIO_NAME}"
+    try:
+        final = store.resolve(dest_rel)
+        if final.is_file():
+            newest = max(store.resolve(f"{store_dir}/{i:04d}.wav").stat().st_mtime_ns for i in range(1, total + 1))
+            if final.stat().st_mtime_ns >= newest:
+                return dest_rel
+    except (OSError, ValueError):
+        pass                          # a chunk is missing / unreadable: assemble_final_audio reports why
+    return assemble_final_audio(store, store_dir, total)
 
 
 def sync_chunks(db, ctx, audio_generation_id) -> list[int]:

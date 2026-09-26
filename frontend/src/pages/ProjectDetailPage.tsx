@@ -15,6 +15,20 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+/** The single joined audio file: a player plus a download link; a failed load explains itself instead of staying mute. */
+function FinalAudio({ client, path }: { client: ApiClient; path: string }) {
+  const [failed, setFailed] = useState(false);
+  const url = client.artifactUrl(path);
+  return (
+    <div className="final-audio" role="group" aria-label="Final audio">
+      <strong>Full audio</strong>{" "}
+      <audio controls preload="none" aria-label="Full audio" src={url} onError={() => setFailed(true)} />{" "}
+      <a href={url} download>Download</a>
+      {failed && <p role="alert" className="muted">The audio could not be loaded; use Download.</p>}
+    </div>
+  );
+}
+
 function str(value: unknown): string {
   return typeof value === "string" || typeof value === "number" ? String(value) : "-";
 }
@@ -90,13 +104,7 @@ function ProjectBody({ project, client }: { project: ProjectSnapshot; client: Ap
         {audio ? (
           <>
             <p>Run {audio.run_number}: {audio.status}; {audio.registered_chunks}/{audio.chunk_count} chunks registered</p>
-            {audio.final_path && (
-              <div className="final-audio" role="group" aria-label="Final audio">
-                <strong>Full audio</strong>{" "}
-                <audio controls preload="none" aria-label="Full audio" src={client.artifactUrl(audio.final_path)} />{" "}
-                <a href={client.artifactUrl(audio.final_path)} download>Download</a>
-              </div>
-            )}
+            {audio.final_path && <FinalAudio client={client} path={audio.final_path} />}
             <AudioChunkList client={client} chunks={audio.chunks} />
           </>
         ) : <p>Audio not generated yet</p>}

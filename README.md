@@ -71,7 +71,7 @@ Everything below is the per-phase engineering history and reference.
 
 **PHASE 9: PASS — STORYFLOW LOCAL MVP COMPLETE.**
 
-Current Status: Phase 0–9 COMPLETE · Migration head `0005_control_plane` · Backend tests `684 passed, 6 skipped` (×3; the skips are the opt-in real smokes) · Frontend: typecheck clean, `114 passed` unit tests, `vite build` OK, real-backend E2E `2 passed` · `python scripts/release_smoke.py`: 11/11 executable steps PASS (real-provider step 12 opt-in: story + TTS PASS, real YouTube fetch skipped: provider blocks this IP).
+Current Status: Phase 0–9 COMPLETE plus the post-MVP batch roadmap P0–P5 (below) · Migration head `0009_feed_min_duration` · Backend tests `1933 passed, 7 skipped` (the skips are the opt-in real smokes and a Windows symlink test) · Frontend: typecheck clean, `144 passed` unit tests, `vite build` OK · `python scripts/release_smoke.py`: 10/10 executable steps PASS, including the new step 13 (a whole offline channel: dedupe, skip, window, review + revision, one joined `final.wav`, retry, sync); real-provider step 12 is opt-in.
 
 Supported real providers: local `claude` CLI (story/canon), local VieNeu-TTS (synthesis), pinned Subtitle_supperVip via subprocess (needs `requirements-subtitle.txt`). Known external limitations: YouTube blocks subtitle fetches from some IPs; no authentication (loopback-only by design); Ctrl+C in `start-app.bat` shows cmd's "Terminate batch job (Y/N)?" prompt.
 
@@ -86,6 +86,7 @@ Current migration head:
 → 0006_source_policy
 → 0007_source_feeds
 → 0008_story_reviews
+→ 0009_feed_min_duration
 ```
 
 ### Post-MVP roadmap progress (batch operation)
@@ -97,6 +98,7 @@ Current migration head:
 | P2 channel / playlist / video-list / local-file input, processed-video ledger, sync of new videos, subtitle inbox (migration `0007`, `POST /api/workflows/{id}/sources`, `/sync`, `GET .../feeds`) | done - see `docs/OPERATIONS.md` "Adding videos, playlists and channels" |
 | P3 batch orchestration: `batch.max_active` window (overlap without flooding YouTube), a failed AI/TTS step ends only that project (`on_permanent_error: continue`), `POST /api/projects/{id}/retry` | done - see `docs/OPERATIONS.md` "How many projects run at once" |
 | P4 review + revision and presets: `"preset": "fast"` (default) / `"balanced"` (an editor call records verdict + issues) / `"quality"` (the editor also returns a corrected story, up to 2 rounds) (migration `0008`) | done - see `docs/OPERATIONS.md` "Presets" |
+| P5 hardening: three independent code reviews found real bugs, all fixed - a `continue` policy that finalize-time failures bypassed, systemic failures (quota, login, runner down) that could burn a whole batch (now they pause + a circuit breaker), unavailable videos that paused a batch, partial `failure_policy` losing backoff, `final.wav` over 256 MB refused by the API (audio cap now 4 GiB) and built in memory (now streamed), revisions that could shrink or truncate a story, stranded projects on finish/cancel races, unbounded source ingestion; orchestrator ~3x faster with a durable `completed` project status; `final_path` in the API/UI; migrations `0009` | done |
 
 Phase 9 validation: backend `684 passed, 6 skipped` on three independent runs (Phase 8: 541, Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 

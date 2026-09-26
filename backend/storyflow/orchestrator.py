@@ -20,10 +20,13 @@ so ticking N times or from many threads/processes yields exactly one active job 
 No DB transaction is held across ``source.run`` or the dispatcher.
 """
 
+import contextlib
 import logging
+import threading
 from dataclasses import dataclass, field
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 
 from . import queue
 from .dispatcher import Dispatcher, DispatchOutcome
@@ -34,12 +37,14 @@ from .models import (
     PauseReason,
     PipelineJob,
     ProjectStatus,
+    SourceSnapshot,
     StoryProject,
     TERMINAL_PROJECT_STATUSES,
+    VersionStatus,
     WorkflowSession,
 )
 from .pipeline import InlineStepHandler, PipelineContext, StepHandler, StepStatus
-from .policy import PERMANENT, batch_from_config, policy_from_config, terminal_status_for
+from .policy import BREAKER_LIMIT, PERMANENT, batch_from_config, is_systemic_error, policy_from_config, terminal_status_for
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +126,23 @@ class Orchestrator:
         self.steps = list(steps)
         self.chain: list = [source, *self.steps]
         self._fingerprints: dict[str, tuple] = {}   # workflow id -> state after its last round (see run_round)
+        self._locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
 
     # ------------------------------------------------------------------ helpers
+
+    def _lock_for(self, workflow_id: str | None):
+        """In-process lock per workflow: a tick and an operator command (retry / resume / reactivate) never
+        interleave, so a tick cannot observe a half-armed project. Never held while a job is dispatched. Other
+        processes are still covered by the compare-and-set on the workflow status and the unique indexes."""
+        if workflow_id is None:
+            return contextlib.nullcontext()
+        with self._locks_guard:
+            return self._locks.setdefault(workflow_id, threading.RLock())
+
+    def _workflow_id_of(self, project_id: str) -> str | None:
+        with self.ctx.session_factory() as db:
+            return db.scalar(select(StoryProject.channel_workflow_id).where(StoryProject.id == project_id), **_FRESH)
 
     def _now(self, now):
         return now or self.ctx.clock()
@@ -207,6 +227,9 @@ class Orchestrator:
         if view.status is StepStatus.COMPLETED:
             return _DONE
         if view.status is StepStatus.FAILED:
+            if self._end_by_policy(db, project_id, wf, handler.step, view.error_code):
+                res.ended.append((project_id, handler.step, view.error_code))
+                return _ENDED
             return _FAILED
         inline = isinstance(handler, InlineStepHandler)
         if view.status is StepStatus.NOT_STARTED:
@@ -254,7 +277,13 @@ class Orchestrator:
             handler.mark_failed(db, self.ctx, domain_id, job)
             logger.info("step_failed project=%s step=%s job=%s error_code=%s", project_id, handler.step, job.id,
                         str(job.last_error_code)[:80])
-            if self._end_by_policy(db, project_id, wf, handler.step, job.last_error_code):
+            # a step may tolerate its own failure (an advisory review with ``on_failure: skip``): if it now reports
+            # COMPLETED the chain simply moves on: not a workflow failure and not a reason to end the project
+            db.expire_all()
+            if handler.status(db, self.ctx, db.get(StoryProject, project_id)).status is StepStatus.COMPLETED:
+                return _AGAIN
+            code = job.last_error_code or ("cancelled" if job.status == JobStatus.CANCELLED.value else None)
+            if self._end_by_policy(db, project_id, wf, handler.step, code):
                 res.ended.append((project_id, handler.step, job.last_error_code))
                 return _ENDED
             res.failed.append((project_id, handler.step, job.last_error_code))
@@ -263,16 +292,28 @@ class Orchestrator:
 
     def _end_by_policy(self, db, project_id: str, wf: ChannelWorkflow, step: str, code: str | None) -> bool:
         """``failure_policy.on_permanent_error == "continue"``: a step that failed for good ends only THIS project
-        (needs_attention) instead of pausing the whole workflow. Returns True when the project was ended."""
+        (needs_attention) instead of pausing the whole workflow. Returns True when the project was ended.
+
+        Only an error of THAT item qualifies: a systemic code (quota / auth / infrastructure / capacity, see
+        ``policy.SYSTEMIC_CODES``) would hit every project, so the workflow pauses instead. A circuit breaker also
+        pauses it once ``BREAKER_LIMIT`` projects already ended with the same reason: the cause is not the item."""
         status = terminal_status_for(policy_from_config(wf.config), PERMANENT)
-        if status is None:
+        if status is None or is_systemic_error(code):
             return False
         db.expire_all()
         project = db.get(StoryProject, project_id)
         if project is None or project.status in TERMINAL_PROJECT_STATUSES:
             return project is not None
+        reason = str(code or "step_failed")[:64]
+        same = db.scalar(select(func.count()).select_from(StoryProject).where(
+            StoryProject.channel_workflow_id == wf.id, StoryProject.status == ProjectStatus.NEEDS_ATTENTION.value,
+            StoryProject.status_reason == reason)) or 0
+        if same >= BREAKER_LIMIT:
+            logger.warning("circuit_breaker workflow=%s reason=%s already_ended=%d: pausing instead of ending "
+                           "project=%s", wf.id, reason, same, project_id)
+            return False
         project.status = status
-        project.status_reason = str(code or "step_failed")[:64]
+        project.status_reason = reason
         project.status_detail = {"step": step, "error_code": code}
         project.next_attempt_at = None
         project.updated_at = self.ctx.clock()
@@ -339,6 +380,32 @@ class Orchestrator:
     def tick(self, workflow_id: str, *, now=None) -> TickResult:
         """recover stale jobs + reconcile in-flight steps + schedule the next missing step.
         Never dispatches. A non-ACTIVE workflow does nothing."""
+        with self._lock_for(workflow_id):
+            return self._tick(workflow_id, now=now)
+
+    def _safe_position(self, db, project_id: str) -> ProjectState:
+        """``_position`` that cannot take a whole tick down: a project whose state cannot even be read is reported
+        as a failed 'orchestrator' step (the workflow pauses visibly) instead of raising every iteration."""
+        try:
+            return self._position(db, project_id)
+        except OperationalError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("project_position_failed project=%s", project_id)
+            db.rollback()
+            return ProjectState("orchestrator", StepStatus.FAILED, error_code="internal_error")
+
+    def _contain(self, db, wf: ChannelWorkflow, project_id: str, res: TickResult) -> None:
+        """One project raised while it was advanced: log it and handle it like any permanent item error (ended under
+        ``continue``, else the workflow pauses with a visible step_failed) so the others are not blocked."""
+        logger.exception("project_advance_failed workflow=%s project=%s", wf.id, project_id)
+        db.rollback()
+        if self._end_by_policy(db, project_id, wf, "orchestrator", "internal_error"):
+            res.ended.append((project_id, "orchestrator", "internal_error"))
+        else:
+            res.failed.append((project_id, "orchestrator", "internal_error"))
+
+    def _tick(self, workflow_id: str, *, now=None) -> TickResult:
         now = self._now(now)
         db = self.ctx.session_factory()
         try:
@@ -361,12 +428,17 @@ class Orchestrator:
                         seen[pid] = pos
                         continue                                  # waits for a free slot (untouched this tick)
                     slots -= 1
-                self._advance_project(db, pid, wf, now, res)
+                try:
+                    self._advance_project(db, pid, wf, now, res)
+                except OperationalError:
+                    raise                   # database busy / locked: transient, the next iteration simply retries
+                except Exception:  # noqa: BLE001 - one bad project must not stop the round for the others
+                    self._contain(db, wf, pid, res)
                 if slots is not None:
-                    after = seen[pid] = self._position(db, pid)
+                    after = seen[pid] = self._safe_position(db, pid)
                     if after.step is None:
                         slots += 1          # finished / ended during this very tick: the next project may start now
-            res.projects = {pid: seen[pid] if pid in seen else self._position(db, pid) for pid in pids}
+            res.projects = {pid: seen[pid] if pid in seen else self._safe_position(db, pid) for pid in pids}
             failure = self._first_failure(res)
             if failure is not None:
                 project_id, step, error_code = failure
@@ -374,13 +446,24 @@ class Orchestrator:
                     db, workflow_id, ChannelWorkflowStatus.PAUSED, expect=ChannelWorkflowStatus.ACTIVE, now=now,
                     reason=PauseReason.STEP_FAILED,
                     detail={"project_id": project_id, "step": step, "error_code": error_code})
-            elif pids and all(st.step is None for st in res.projects.values()):
-                self._set_workflow_status(db, workflow_id, ChannelWorkflowStatus.FINISHED,
-                                          expect=ChannelWorkflowStatus.ACTIVE, now=now)
+            elif pids and all(st.step is None for st in res.projects.values()) \
+                    and set(self._project_ids(db, workflow_id)) == set(pids):
+                # a project added meanwhile (add_sources / add_project) is not in ``pids``: do not finish over it
+                if self._set_workflow_status(db, workflow_id, ChannelWorkflowStatus.FINISHED,
+                                             expect=ChannelWorkflowStatus.ACTIVE, now=now):
+                    self._reopen_if_stranded(db, workflow_id, now)
             res.workflow_status = self._workflow(db, workflow_id).status
             return res
         finally:
             db.close()
+
+    def _reopen_if_stranded(self, db, workflow_id: str, now) -> None:
+        """After the FINISHED compare-and-set won: a project may have been added / re-armed between the position
+        scan and the CAS (the writer saw ACTIVE and therefore did not re-open). Look again; if anything is not
+        closed, FINISHED -> ACTIVE so it is not stranded in a finished workflow."""
+        if any(self._safe_position(db, pid).step is not None for pid in self._project_ids(db, workflow_id)):
+            self._set_workflow_status(db, workflow_id, ChannelWorkflowStatus.ACTIVE,
+                                      expect=ChannelWorkflowStatus.FINISHED, now=now)
 
     @staticmethod
     def _first_failure(res: TickResult):
@@ -478,6 +561,7 @@ class Orchestrator:
         otherwise resume / retry would queue jobs for a project the batch already gave up on."""
         if self._is_terminal(db, project_id):
             return None
+        self._reset_source_retry(db, project_id)
         for handler in self._handlers(db, project_id):
             db.expire_all()
             view = handler.status(db, self.ctx, db.get(StoryProject, project_id))
@@ -494,7 +578,35 @@ class Orchestrator:
             return handler.step
         return None
 
+    @staticmethod
+    def _reset_source_retry(db, project_id: str) -> None:
+        """An operator retry / resume gives a project whose subtitles are still missing a fresh set of source
+        attempts (otherwise ``subtitle_retries_exhausted`` would come back after a single try). Only the
+        source-retry state is touched, and only while there is no snapshot yet."""
+        db.expire_all()
+        project = db.get(StoryProject, project_id)
+        if project is None or project.status != ProjectStatus.ACTIVE.value:
+            return
+        if not (project.source_attempts or project.next_attempt_at):
+            return
+        has_snapshot = db.scalar(select(SourceSnapshot.id).where(
+            SourceSnapshot.story_project_id == project_id, SourceSnapshot.status == VersionStatus.ACTIVE.value)
+            .limit(1)) is not None
+        if has_snapshot:
+            return
+        project.source_attempts = 0
+        project.next_attempt_at = None
+        detail = {k: v for k, v in (project.status_detail or {}).items()
+                  if k not in ("last_error", "attempts", "retry_in_seconds")}
+        project.status_detail = detail or None
+        db.commit()
+
     def reactivate_project(self, project_id: str, *, now=None) -> str | None:
+        """Operator action (serialised with the workflow's ticks): see ``_reactivate_project``."""
+        with self._lock_for(self._workflow_id_of(project_id)):
+            return self._reactivate_project(project_id, now=now)
+
+    def _reactivate_project(self, project_id: str, *, now=None) -> str | None:
         """Operator action: bring a skipped / needs_attention project back into its workflow. Returns the step
         that had ended it (None when the project was not ended). A job step that failed gets a fresh domain row
         + job; the inline source step simply runs again on the next tick. A finished workflow is re-opened."""
@@ -537,6 +649,11 @@ class Orchestrator:
             db.close()
 
     def retry_failed_step(self, project_id: str, *, now=None) -> str | None:
+        """Operator action (serialised with the workflow's ticks): see ``_retry_failed_step``."""
+        with self._lock_for(self._workflow_id_of(project_id)):
+            return self._retry_failed_step(project_id, now=now)
+
+    def _retry_failed_step(self, project_id: str, *, now=None) -> str | None:
         """Operator action: give a project's FAILED step a fresh domain row + job, and reactivate
         the workflow if that was its last failure. Never called automatically."""
         now = self._now(now)
@@ -558,6 +675,11 @@ class Orchestrator:
             db.close()
 
     def resume(self, workflow_id: str, *, now=None) -> str:
+        """Operator action (serialised with the workflow's ticks): see ``_resume``."""
+        with self._lock_for(workflow_id):
+            return self._resume(workflow_id, now=now)
+
+    def _resume(self, workflow_id: str, *, now=None) -> str:
         """Operator action: retry every FAILED step of a PAUSED workflow, then PAUSED -> ACTIVE.
         FINISHED / ABANDONED workflows are left untouched. Returns the workflow status."""
         now = self._now(now)

@@ -46,6 +46,7 @@ from .models import (
     SourceSnapshot,
     StoryGeneration,
     StoryProject,
+    StoryReview,
     StoryVersion,
     TERMINAL_PROJECT_STATUSES,
     TERMINAL_WORKFLOW_STATUSES,
@@ -54,7 +55,9 @@ from .models import (
 )
 from .orchestrator import Orchestrator
 from .pipeline import PipelineContext
-from .policy import RECOMMENDED, RECOMMENDED_BATCH_SETTINGS, PolicyError, parse_batch_settings, parse_failure_policy
+from .policy import (
+    RECOMMENDED, RECOMMENDED_BATCH_SETTINGS, PolicyError, parse_batch_settings, parse_failure_policy, with_recommended,
+)
 from .presets import PresetError, apply_preset
 from .roles import Role
 
@@ -93,6 +96,7 @@ def _logged_runner(action: str):
 
 
 _MAX_SLUG_TRIES = 50
+_MAX_TARGET_LENGTH = 50000
 _RETRY_CLAIM_TTL = timedelta(seconds=60)
 _IN_CHUNK = 400
 
@@ -204,6 +208,7 @@ class WorkflowService:
             json.dumps(config)
         except (TypeError, ValueError):
             raise ValidationFailed("config must be JSON-serializable", reason="config_not_json") from None
+        self._validate_config_shapes(config)
         if all_agents_unavailable_policy not in _VALID_POLICIES:
             raise ValidationFailed("invalid all_agents_unavailable_policy", reason="invalid_policy",
                                    allowed=list(_VALID_POLICIES))
@@ -217,6 +222,8 @@ class WorkflowService:
             raise ValidationFailed(str(exc), reason="invalid_batch") from None
         if "failure_policy" not in config:  # record the policy that applies (retry with backoff, then pause)
             config = {**config, "failure_policy": dict(RECOMMENDED)}
+        else:  # a partial policy keeps the recommended retry limit / backoff for the keys it does not mention
+            config = {**config, "failure_policy": with_recommended(config["failure_policy"])}
         if "batch" not in config:  # record how many projects run at once (a batch must not hit YouTube all at once)
             config = {**config, "batch": dict(RECOMMENDED_BATCH_SETTINGS)}
         try:
@@ -317,8 +324,13 @@ class WorkflowService:
                     chosen = slug
                 else:
                     chosen = self._free_slug(db, slugify(title))
+                source_cfg = (db.scalar(select(ChannelWorkflow.config).where(ChannelWorkflow.id == workflow_id))
+                              or {}).get("source")
+                video_id = source_cfg.get("video_id") if isinstance(source_cfg, dict) else None
                 project = StoryProject(channel_workflow_id=workflow_id, title=title, slug=chosen,
-                                       description=description, created_at=now, updated_at=now)
+                                       description=description, created_at=now, updated_at=now,
+                                       video_id=video_id if isinstance(video_id, str) and 0 < len(video_id) <= 64
+                                       else None)
                 db.add(project)
                 try:
                     db.commit()
@@ -331,6 +343,29 @@ class WorkflowService:
             finally:
                 db.close()
         raise Conflict("could not allocate a unique slug", reason="slug_exhausted")
+
+    @staticmethod
+    def _validate_config_shapes(config: dict) -> None:
+        """The blocks the pipeline reads (source / story / tts) must have the right TYPES, otherwise every tick
+        would raise while advancing the project. Messages are fixed strings: nothing from the request is echoed."""
+        def bad(field: str, text: str):
+            raise ValidationFailed(text, reason="invalid_config", field=field)
+
+        for key in ("source", "story", "tts"):
+            if config.get(key) is not None and not isinstance(config[key], dict):
+                bad(key, f"config.{key} must be an object")
+        video_id = (config.get("source") or {}).get("video_id")
+        if video_id is not None and (not isinstance(video_id, str) or not 1 <= len(video_id) <= 64):
+            bad("source.video_id", "config.source.video_id must be a short text")
+        story = config.get("story") or {}
+        target = story.get("target_length")
+        if target is not None and (isinstance(target, bool) or not isinstance(target, int)
+                                   or not 1 <= target <= _MAX_TARGET_LENGTH):
+            bad("story.target_length", f"config.story.target_length must be a whole number of words "
+                                       f"(1 to {_MAX_TARGET_LENGTH})")
+        for key in ("branch", "direction"):
+            if story.get(key) is not None and not isinstance(story[key], str):
+                bad(f"story.{key}", f"config.story.{key} must be text")
 
     def _project_result(self, db, workflow_id, project: StoryProject, changed: bool) -> CommandResult:
         wf = self._get(db, workflow_id)
@@ -605,13 +640,16 @@ class WorkflowService:
         versions = self._ids(db, StoryVersion.id, StoryVersion.story_project_id, pids)
         ttss = self._ids(db, TTSGeneration.id, TTSGeneration.story_version_id, versions)
         audios = self._ids(db, AudioGeneration.id, AudioGeneration.tts_generation_id, ttss)
+        reviews = self._ids(db, StoryReview.id, StoryReview.story_project_id, pids)
 
         job_ids: set[str] = set()
-        for model, ids in ((CanonAnalysis, canons), (StoryGeneration, gens), (TTSGeneration, ttss)):
+        for model, ids in ((CanonAnalysis, canons), (StoryGeneration, gens), (TTSGeneration, ttss),
+                           (StoryReview, reviews)):
             for part in _chunks(ids):
                 job_ids.update(j for j in db.scalars(
                     select(model.pipeline_job_id).where(model.id.in_(part), model.pipeline_job_id.is_not(None))).all())
-        keys = [f"{p}:{i}" for p, ids in (("canon", canons), ("story", gens), ("tts", ttss), ("audio", audios))
+        keys = [f"{p}:{i}" for p, ids in (("canon", canons), ("story", gens), ("review", reviews), ("tts", ttss),
+                                          ("audio", audios))
                 for i in ids]
         for part in _chunks(keys):
             job_ids.update(db.scalars(select(PipelineJob.id).where(PipelineJob.dedupe_key.in_(part))).all())
@@ -620,8 +658,8 @@ class WorkflowService:
         cancelled_jobs = queue.cancel_pending_jobs(db, sorted(job_ids), now=now) if job_ids else []
 
         rows = 0
-        for model, ids in ((CanonAnalysis, canons), (StoryGeneration, gens), (TTSGeneration, ttss),
-                           (AudioGeneration, audios)):
+        for model, ids in ((CanonAnalysis, canons), (StoryGeneration, gens), (StoryReview, reviews),
+                           (TTSGeneration, ttss), (AudioGeneration, audios)):
             for part in _chunks(ids):
                 res = db.execute(update(model).where(model.id.in_(part), model.status.in_(_OPEN_DOMAIN))
                                  .values(status=DomainStatus.CANCELLED.value, updated_at=now, finished_at=now)

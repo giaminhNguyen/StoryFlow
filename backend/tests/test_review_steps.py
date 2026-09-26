@@ -110,6 +110,11 @@ def test_output_validator_problems(store):
     assert "more than" in validate_review_output(packet(), store)
 
 
+def words(n):
+    """A story of exactly n words that ends like a finished story (full stop)."""
+    return " ".join(["w"] * (n - 1)) + " end."
+
+
 def test_revise_needs_a_revised_story_that_is_long_enough(store):
     put_review(store, review_json("revise"))
     p = packet(revise=True, target=120)
@@ -118,13 +123,13 @@ def test_revise_needs_a_revised_story_that_is_long_enough(store):
     assert "not valid UTF-8" in validate_review_output(p, store)
     store.write(revised_story_path("p1", "r1"), b"too short")
     assert "fewer than" in validate_review_output(p, store)                      # below the absolute minimum
-    store.write(revised_story_path("p1", "r1"), (" ".join(["w"] * 50)).encode())
+    store.write(revised_story_path("p1", "r1"), words(50).encode())
     assert "too short" in validate_review_output(p, store)                       # < 85% of the reviewed story
-    store.write(revised_story_path("p1", "r1"), (" ".join(["w"] * 101)).encode())
+    store.write(revised_story_path("p1", "r1"), words(101).encode())
     assert "too short" in validate_review_output(p, store)                       # 101 < 0.85 * 120 = 102
-    store.write(revised_story_path("p1", "r1"), (" ".join(["w"] * 102)).encode())
+    store.write(revised_story_path("p1", "r1"), words(102).encode())
     assert validate_review_output(p, store) is None                              # exactly the minimum
-    store.write(revised_story_path("p1", "r1"), (" ".join(["w"] * 102) + " /home/user/x").encode())
+    store.write(revised_story_path("p1", "r1"), (words(102) + " /home/user/x").encode())
     assert "absolute path" in validate_review_output(p, store)
     # a "revise" verdict is fine without a revision when the workflow did not ask for one
     assert validate_review_output(packet(revise=False), store) is None
@@ -284,14 +289,14 @@ def test_begin_describes_the_job(db, store, ctx):
     assert inputs == {"project_id": project.id, "source_artifact": f"projects/{project.id}/source/0001/source.txt",
                       "canon_artifact": f"projects/{project.id}/canon/{canon.id}/canon.json",
                       "story_artifact": version.content_path, "story_version_id": version.id, "review_id": review_id,
-                      "round_number": 1, "revise": True, "target_length": 120}
+                      "round_number": 1, "revise": True, "target_length": 120, "min_words": 114}
     assert spec.payload["outputs"] == [review_path(project.id, review_id), revised_story_path(project.id, review_id)]
     assert spec.payload["task_config"] == {"step": "review", "review_id": review_id, "revise": True,
-                                           "target_length": 120}
+                                           "target_length": 120, "min_words": 114}
     assert spec.payload["skill"]["name"] == "story-branch-writer"
     row = fresh(db, StoryReview, review_id)
     assert (row.status, row.round_number, row.story_version_id) == ("queued", 1, version.id)
-    assert row.config == {"revise": True, "max_rounds": 2, "target_length": 120}
+    assert row.config == {"revise": True, "max_rounds": 2, "target_length": 120, "min_words": 114}
     assert ReviewStep().status(db, ctx, project).status is StepStatus.IN_PROGRESS
 
 
@@ -575,8 +580,11 @@ def test_explicit_review_block_beats_the_preset(make_stack):
     assert s.reviews() == [] and "review" not in s.router.order
 
 
+BLOCKING = {"preset": "balanced", "review": {"on_failure": "block"}}    # balanced is advisory by default
+
+
 def test_a_review_that_keeps_failing_pauses_the_workflow_by_default(make_stack):
-    s = make_stack(config={"preset": "balanced"})
+    s = make_stack(config=BLOCKING)
     s.router.poison_review = set(s.pids)
     snap = s.finish("failed")
     assert snap.status == "paused" and snap.status_detail["project_id"] == s.pids[0]
@@ -589,7 +597,7 @@ def test_a_review_that_keeps_failing_pauses_the_workflow_by_default(make_stack):
 
 
 def test_a_failed_review_ends_only_that_project_under_continue(make_stack):
-    s = make_stack(config={"preset": "balanced", "failure_policy": {"on_permanent_error": "continue"}})
+    s = make_stack(config={**BLOCKING, "failure_policy": {"on_permanent_error": "continue"}})
     s.router.poison_review = set(s.pids)
     snap = s.finish()                                                                # nothing else to wait for
     assert snap.status == "finished"
@@ -600,7 +608,7 @@ def test_a_failed_review_ends_only_that_project_under_continue(make_stack):
 
 
 def test_retry_after_a_failed_review_starts_a_fresh_review_and_completes(make_stack):
-    s = make_stack(config={"preset": "balanced"})
+    s = make_stack(config=BLOCKING)
     s.router.poison_review = set(s.pids)
     s.finish("failed")
     s.router.poison_review = set()                                                   # the cause is fixed
@@ -625,7 +633,7 @@ def test_reactivating_a_needs_attention_review_runs_it_again(make_stack):
 
 
 def test_a_poisoned_review_does_not_block_the_other_projects(make_stack):
-    s = make_stack(config={"preset": "balanced", "failure_policy": {"on_permanent_error": "continue"},
+    s = make_stack(config={**BLOCKING, "failure_policy": {"on_permanent_error": "continue"},
                            "batch": {"max_active": None}}, projects=3)
     s.router.poison_review = {s.pids[1]}
     snap = s.finish()

@@ -90,9 +90,12 @@ _CATEGORY_CODES = {
     BUSINESS: {"task_failed", "invalid_output", "invalid_canon", "invalid_story", "missing_output",
                "partial_failure", "chunks_missing", "empty_source", "source_not_configured", "inbox_file_missing",
                "project_not_found", "job_failed", "missing_input", "bad_output_path", "unknown_step",
-               "invalid_review", "review_failed"},
+               "invalid_review", "bad_json", "no_json", "bad_verdict", "no_revised_story", "bad_delimiter",
+               "output_too_large", "output_truncated", "bad_path", "bad_encoding", "invalid_envelope",
+               "empty_result"},
     INFRASTRUCTURE: {"infra_exhausted", "lease_expired", "runner_crashed", "timeout",
-                     "transient_failure", "rate_limited", "quota_exhausted", "auth_error"},
+                     "transient_failure", "rate_limited", "quota_exhausted", "auth_error",
+                     "cli_failed", "cli_error", "cli_not_found"},
     CAPACITY: {"all_agents_unavailable"},
     PROVIDER: {"provider_blocked", "provider_timeout", "provider_unavailable", "subtitles_unavailable",
                 "language_unavailable", "subtitle_retries_exhausted"},
@@ -116,7 +119,7 @@ _MAX_REVIEW_ISSUES = 20      # issues shown per review in a snapshot (each note 
 
 # ---------------------------------------------------------------------------- sanitising
 
-_WIN_PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"']*")
+_WIN_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:(?:\\|/(?!/))[^\s\"']*")   # C:\dir, D:/x - not https://
 _UNIX_PATH = re.compile(r"(?<![\w.])/(?:home|Users|tmp|var|etc|usr|mnt|root|opt|private)/[^\s\"']*")
 
 
@@ -317,6 +320,7 @@ class ReviewInfo:
     revised: bool = False             # this round produced a newer story version
     revised_version_id: str | None = None
     error_code: str | None = None
+    rounds: int = 1                   # how many review rounds the project has (this one is the latest)
 
 
 @dataclass(frozen=True)
@@ -538,7 +542,7 @@ def _preset_of(config) -> str | None:
     return value[:32] if isinstance(value, str) and value else None
 
 
-def _review_info(row: StoryReview) -> ReviewInfo:
+def _review_info(row: StoryReview, rounds: int = 1) -> ReviewInfo:
     issues = []
     for item in (row.findings or []):
         if isinstance(item, dict):
@@ -548,7 +552,8 @@ def _review_info(row: StoryReview) -> ReviewInfo:
     return ReviewInfo(
         id=row.id, round_number=row.round_number or 1, status=row.status, verdict=row.verdict,
         summary=_bound(row.summary), issue_count=len(issues), issues=issues[:_MAX_REVIEW_ISSUES],
-        revised=bool(row.revised_version_id), revised_version_id=row.revised_version_id, error_code=row.error_code)
+        revised=bool(row.revised_version_id), revised_version_id=row.revised_version_id, error_code=row.error_code,
+        rounds=max(rounds, 1))
 
 
 def _display_from(status: str, reason: str | None, project_states: list) -> str:
@@ -846,6 +851,8 @@ class ReadModels:
         review_row = db.scalars(select(StoryReview).where(StoryReview.story_project_id == project.id)
                                 .order_by(StoryReview.round_number.desc(), StoryReview.created_at.desc(),
                                           StoryReview.id).limit(1), **_FRESH).first()
+        review_rounds = db.scalar(select(func.count()).select_from(StoryReview)
+                                  .where(StoryReview.story_project_id == project.id)) or 0
         revision_count = max((db.scalar(select(func.count()).select_from(StoryVersion).where(
             StoryVersion.story_project_id == project.id, StoryVersion.status == VersionStatus.ACTIVE.value)) or 0) - 1,
             0)
@@ -867,7 +874,8 @@ class ReadModels:
             status_detail=dict(project.status_detail) if project.status_detail else None,
             source_attempts=project.source_attempts or 0, next_attempt_at=project.next_attempt_at,
             video_id=project.video_id, feed_id=project.feed_id,
-            review=_review_info(review_row) if review_row is not None else None, revision_count=revision_count)
+            review=_review_info(review_row, review_rounds) if review_row is not None else None,
+            revision_count=revision_count)
 
     @staticmethod
     def _state(current, cur_view, block, failure) -> str:

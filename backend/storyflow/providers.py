@@ -39,6 +39,8 @@ stores or logs them, and ``ProviderStatus`` carries only a state + a short, path
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import shutil
 import sys
@@ -48,6 +50,7 @@ from pathlib import Path
 from .config import PROJECT_ROOT
 
 ENV_PREFIX = "STORYFLOW_"
+logger = logging.getLogger(__name__)
 
 SUBTITLE_PROVIDERS = ("external", "fake", "none")
 STORY_RUNNERS = ("none", "claude-cli", "fake")
@@ -97,6 +100,7 @@ class ProviderConfig:
     ytdlp_python: str = field(default_factory=lambda: sys.executable)
     lister_timeout: float = 120.0
     inbox_dir: str | None = None
+    lister_timeout_invalid: bool = False   # STORYFLOW_LISTER_TIMEOUT was not a positive number: the default is used
 
     def problems(self) -> list[str]:
         """Invalid values (reported as MISCONFIGURED; never raised so the app still starts)."""
@@ -114,6 +118,9 @@ class ProviderConfig:
                 out.append(f"{name} must be > 0")
         if self.vieneu_threads < 1:
             out.append("STORYFLOW_VIENEU_THREADS must be >= 1")
+        if self.lister_timeout_invalid:
+            out.append("lister_timeout: STORYFLOW_LISTER_TIMEOUT must be a positive number "
+                       "(the default 120 s is used)")
         return out
 
     def resolved_subtitle_backend_dir(self) -> Path:
@@ -185,6 +192,19 @@ def load_provider_config(env: dict | None = None, env_files: list[Path] | None =
             return -1  # surfaces through problems()
 
     defaults = ProviderConfig()
+    lister_timeout, lister_timeout_invalid = defaults.lister_timeout, False
+    raw_lister_timeout = get("LISTER_TIMEOUT")
+    if raw_lister_timeout is not None and not raw_lister_timeout.strip():
+        raw_lister_timeout = None           # blank = not configured
+    if raw_lister_timeout is not None:
+        try:
+            parsed = float(raw_lister_timeout)
+        except ValueError:
+            parsed = None
+        if parsed is not None and math.isfinite(parsed) and parsed > 0:
+            lister_timeout = parsed
+        else:                       # never let a typo turn every channel listing into an instant "timeout"
+            lister_timeout_invalid = True
     return ProviderConfig(
         subtitle_provider=get("SUBTITLE_PROVIDER", defaults.subtitle_provider).lower(),
         subtitle_python=get("SUBTITLE_PYTHON", defaults.subtitle_python),
@@ -202,7 +222,8 @@ def load_provider_config(env: dict | None = None, env_files: list[Path] | None =
         vieneu_voice=get("VIENEU_VOICE", defaults.vieneu_voice),
         tts_timeout=number("TTS_TIMEOUT", defaults.tts_timeout, float),
         ytdlp_python=get("YTDLP_PYTHON", defaults.ytdlp_python),
-        lister_timeout=number("LISTER_TIMEOUT", defaults.lister_timeout, float),
+        lister_timeout=lister_timeout,
+        lister_timeout_invalid=lister_timeout_invalid,
         inbox_dir=get("INBOX_DIR"),
     )
 
@@ -220,6 +241,7 @@ class ProviderStack:
     runner_providers: list
     _status_fns: list = field(default_factory=list)
     video_lister: object | None = None      # storyflow.sources.VideoLister (channel / playlist expansion)
+    warnings: list = field(default_factory=list)   # configuration problems that have no provider status of their own
 
     def statuses(self) -> list[ProviderStatus]:
         return [fn() for fn in self._status_fns]
@@ -241,6 +263,7 @@ def build_provider_stack(config: ProviderConfig, store) -> ProviderStack:
     from .runtime.app import PipelineRouter, demo_subtitle_client  # lazy: avoids an import cycle
     from .runtime.supervisor import StaticRunnerProvider
     from .roles import Role
+    from .review_steps import FakeReviewRunner
     from .story_steps import FakeStoryPipelineRunner
     from .subtitles import ProviderUnavailable, SubtitleClient
     from .tts_steps import FakeAudioRunner, FakeTTSAdapterRunner
@@ -250,6 +273,10 @@ def build_provider_stack(config: ProviderConfig, store) -> ProviderStack:
     problems = config.problems()
     stack = ProviderStack(config=config, subtitle_client=None, runner_providers=[],
                           video_lister=YtDlpLister(config.ytdlp_python, config.lister_timeout))
+    for problem in problems:
+        if "lister_timeout" in problem:      # not tied to a subtitle / story / tts status: keep it visible anyway
+            stack.warnings.append(problem)
+            logger.warning("provider configuration: %s", problem)
 
     def bad(kind, name, text):
         return ProviderStatus(name, kind, MISCONFIGURED, text)
@@ -290,8 +317,20 @@ def build_provider_stack(config: ProviderConfig, store) -> ProviderStack:
         stack.runner_providers.append(provider)
         stack._status_fns.append(provider.status)
     elif story == "fake":
+        class _FakeStoryRouter(FakeStoryPipelineRunner):
+            """canon / story from the story fake, review (balanced / quality presets) from the review fake."""
+
+            def __init__(self, store):
+                super().__init__(store)
+                self.review = FakeReviewRunner(store)
+
+            def execute(self, packet):
+                if (packet.task_config or {}).get("step") == "review":
+                    return self.review.execute(packet)
+                return super().execute(packet)
+
         stack.runner_providers.append(StaticRunnerProvider(
-            {"fake-story-1": FakeStoryPipelineRunner(store)}, name="fake-story", roles=[Role.STORY_WRITER.value]))
+            {"fake-story-1": _FakeStoryRouter(store)}, name="fake-story", roles=[Role.STORY_WRITER.value]))
         stack._status_fns.append(_static(ProviderStatus("fake", "story", FAKE, "deterministic fake story runner")))
     else:
         stack._status_fns.append(_static(ProviderStatus(

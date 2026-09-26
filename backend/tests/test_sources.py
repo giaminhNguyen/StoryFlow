@@ -179,10 +179,11 @@ def test_argv_shape():
     lister = YtDlpLister(python="C:\\py\\python.exe")
     argv = lister.argv(ParsedSource(CHANNEL, CHANNEL_URL), 5)
     assert argv[:2] == ["C:\\py\\python.exe", "-m"] and argv[2] == "yt_dlp"
-    for flag in ("--flat-playlist", "--no-warnings", "--ignore-errors"):
-        assert flag in argv
+    for flag in ("--flat-playlist", "--no-warnings", "--ignore-errors", "--ignore-config", "--no-cache-dir"):
+        assert flag in argv                               # a user's yt-dlp.conf must never change the listing
+    assert argv[argv.index("--socket-timeout") + 1] == "20" and argv[argv.index("--extractor-retries") + 1] == "2"
     assert argv[argv.index("--playlist-end") + 1] == "5"
-    assert argv[argv.index("--print") + 1] == "%(id)s\t%(duration)s\t%(playlist_title)s\t%(title)s"
+    assert argv[argv.index("--print") + 1] == "%(.{id,duration,playlist_title,title})j"   # one JSON object per entry
     assert argv[-1] == CHANNEL_URL + "/videos"                                   # the URL is the last argument
 
 
@@ -254,7 +255,7 @@ def test_list_videos_runs_the_subprocess_safely():
     list_with(run, ParsedSource(PLAYLIST, PL), limit=3, timeout=45.0)
     (cmd, kwargs), = run.calls
     assert cmd == YtDlpLister(python="py").argv(ParsedSource(PLAYLIST, PL), 3)
-    assert kwargs["capture_output"] is True and kwargs["timeout"] == 45.0
+    assert kwargs["capture_output"] is True and kwargs["timeout"] == pytest.approx(45.0, abs=1.0)
     assert kwargs["stdin"] == subprocess.DEVNULL                    # a listing must never wait for input
     assert kwargs["env"]["PYTHONIOENCODING"] == "utf-8" and kwargs["env"]["PYTHONUTF8"] == "1"
     assert "shell" not in kwargs                                    # argv list, never a shell string
@@ -579,11 +580,16 @@ def test_read_inbox_text_size_cap(inbox):
     assert read_inbox_text(inbox, "max.txt") == "a" * MAX_INBOX_BYTES
 
 
-def test_read_inbox_text_non_utf8_is_none(inbox):
-    (inbox / "bin.txt").write_bytes(b"\xff\xfe\xfa\x00")
-    (inbox / "cp1252.srt").write_bytes("caf\xe9".encode("cp1252"))
+def test_read_inbox_text_binary_junk_is_none(inbox):
+    (inbox / "bin.txt").write_bytes(b"\x00\x01\x02\x03 binary")
+    (inbox / "undefined.txt").write_bytes(b"\x81\x8d\x8f\x90")      # undefined in cp1252, invalid UTF-8
     assert read_inbox_text(inbox, "bin.txt") is None
-    assert read_inbox_text(inbox, "cp1252.srt") is None
+    assert read_inbox_text(inbox, "undefined.txt") is None
+
+
+def test_read_inbox_text_falls_back_to_cp1252_for_old_ansi_files(inbox):
+    (inbox / "cp1252.srt").write_bytes("caf\xe9".encode("cp1252"))
+    assert read_inbox_text(inbox, "cp1252.srt") == "caf\xe9"
 
 
 def test_read_inbox_text_refuses_a_symlink_that_escapes_the_inbox(tmp_path, inbox):

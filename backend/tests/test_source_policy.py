@@ -326,10 +326,14 @@ def test_create_workflow_records_the_recommended_policy_by_default(workflows, db
     assert fresh(db, ChannelWorkflow, wf_id).config["failure_policy"] == RECOMMENDED
 
 
-def test_create_workflow_keeps_an_explicit_policy(workflows, db):
+def test_create_workflow_merges_an_explicit_policy_over_the_recommended_values(workflows, db):
     policy = {"on_no_subtitle": "skip"}
     wf_id = workflows.create_workflow("w", config={"failure_policy": policy}).workflow_id
-    assert fresh(db, ChannelWorkflow, wf_id).config["failure_policy"] == policy
+    stored = fresh(db, ChannelWorkflow, wf_id).config["failure_policy"]
+    assert stored == {**RECOMMENDED, "on_no_subtitle": "skip"}      # the given key wins, the rest keeps the backoff
+    assert policy == {"on_no_subtitle": "skip"}                       # the caller's dict is not mutated
+    opt_out = workflows.create_workflow("w2", config={"failure_policy": {"subtitle_retries": None}}).workflow_id
+    assert fresh(db, ChannelWorkflow, opt_out).config["failure_policy"]["subtitle_retries"] is None
 
 
 @pytest.mark.parametrize("bad", [{"on_no_subtitle": "explode"}, {"subtitle_retries": 0}, {"bogus": 1}, "skip"])

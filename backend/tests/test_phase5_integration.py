@@ -225,8 +225,9 @@ def test_two_runtime_instances_never_duplicate_work(tmp_path):
         with first.app.session_factory() as db:
             indexes = [c.chunk_index for c in db.scalars(select(AudioChunk))]
             assert len(indexes) == len(set(indexes))
-            kinds = sorted(j.kind for j in db.scalars(select(PipelineJob)))
-        assert kinds == ["audio_generation", "canon_analysis", "story_generation", "tts_generation"]
+            jobs = db.scalars(select(PipelineJob)).all()
+            kinds = sorted(j.kind for j in jobs)
+        assert kinds == ["audio_generation", "canon_analysis", "story_generation", "tts_generation"],             [(j.kind, j.status, j.dedupe_key, j.attempts, j.execution_count) for j in jobs]
         assert errors == []
     finally:
         first.app.close()

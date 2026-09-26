@@ -85,6 +85,7 @@ from .subtitles import (
     LanguageUnavailable,
     ProviderTimeout,
     ProviderUnavailable,
+    SubtitleFetchFailed,
     SubtitleSnippet,
     SubtitlesUnavailable,
     plain_text,
@@ -96,6 +97,10 @@ SKILL_PATH = "skills/story-branch-writer"
 _LIVE = (DomainStatus.QUEUED.value, DomainStatus.PROCESSING.value)
 _MAX_TRIES = 5
 MIN_STORY_WORDS = 5
+# The DEFAULT target length is the reference story's word count, capped here: a single ``claude -p`` answer cannot
+# be asked to exceed what it can output, so a 25k-word transcript would otherwise fail (paid) attempt after attempt.
+# An explicit ``story.target_length`` is honoured as given.
+MAX_DEFAULT_TARGET = 15_000
 
 # --- canon schema -------------------------------------------------------------
 
@@ -143,10 +148,34 @@ def validate_canon(obj) -> str | None:
     return None
 
 
-_ABS_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/]|(?:^|[\s\"'(])/(?:home|Users|tmp|var|etc|usr|mnt|root|opt)/")
+_ABS_PATH_RE = re.compile(
+    r"\b[A-Za-z]:[\\/]"                                                                   # C:\ or C:/
+    r"|(?:^|[\s\"'(])/(?:home|Users|tmp|var|etc|usr|mnt|root|opt|Volumes|srv|data|proc)/"    # unix-style roots
+    r"|(?:^|[\s\"'(])\\\\[^\s\\/]+[\\/]"                                                # UNC \\host\share
+    r"|(?:^|[\s\"'(])~/[\w.-]"                                                             # ~/something
+    r"|%(?:USERPROFILE|APPDATA|LOCALAPPDATA|HOMEPATH|TEMP|TMP)%",                          # %USERPROFILE%
+    re.IGNORECASE,
+)
+REPEAT_MIN_LINES = 200        # only judge repetition once there are this many non-empty lines
+REPEAT_MIN_DISTINCT = 0.60    # ... and fewer than this share of them are distinct
 
 
 MIN_LENGTH_RATIO = 0.85  # a story shorter than this share of target_length is rejected (and rewritten)
+
+
+def coerce_target_length(value) -> int | None:
+    """A usable ``story.target_length``: a positive int, or a float / digit string that is a whole number
+    (the API accepts arbitrary JSON, and a string used to be shown in the prompt yet silently NOT enforced).
+    Anything else (bool, 0, negative, fractions, junk) is treated as "not set"."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        value = int(value) if value.is_integer() and abs(value) < 10 ** 9 else None
+    elif isinstance(value, str):
+        value = int(value.strip()) if value.strip().isdigit() and len(value.strip()) <= 9 else None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
 def check_story_text(text: str, store_root: str | None = None, target_length=None) -> str | None:
@@ -163,6 +192,9 @@ def check_story_text(text: str, store_root: str | None = None, target_length=Non
         return "story contains NUL bytes"
     if _ABS_PATH_RE.search(text) or (store_root and store_root in text):
         return "story contains an absolute path"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= REPEAT_MIN_LINES and len(set(lines)) < REPEAT_MIN_DISTINCT * len(lines):
+        return "story is repetitive (the same lines over and over)"
     return None
 
 
@@ -293,16 +325,14 @@ class SourceStep(InlineStepHandler):
             if project.status in TERMINAL_PROJECT_STATUSES:  # already skipped / needs attention
                 return StepView(StepStatus.FAILED, error_code=project.status_reason or project.status)
             retry_at = project.next_attempt_at
-            if retry_at is not None and ctx.clock() < retry_at:  # backing off: do not touch the provider
-                last = (project.status_detail or {}).get("last_error") or "provider_blocked"
-                return StepView(StepStatus.NOT_STARTED, error_code=last)
+            last_error = (project.status_detail or {}).get("last_error") or "provider_blocked"
         video_id = cfg.get("video_id")
         inbox_name = None
         if cfg.get("kind") == "local":                      # a subtitle file dropped in the inbox
             inbox_name = cfg.get("file")
             if not inbox_name or read_inbox_text(ctx.inbox_dir, inbox_name) is None:
                 return self._failed(ctx, project_id, "inbox_file_missing", policy)
-            video_id = video_id or None
+            video_id = None                                 # a local file is not a YouTube video: never inherit one
         elif not video_id:
             return self._failed(ctx, project_id, "source_not_configured", policy)
         else:                                               # an explicit <video_id>.txt/.srt/.vtt beats the provider
@@ -317,6 +347,11 @@ class SourceStep(InlineStepHandler):
             else:
                 inbox_name = None   # unreadable file: use the provider and do not label the snapshot as inbox
 
+        if fetched is None and retry_at is not None and ctx.clock() < retry_at:
+            # backing off: do not touch the provider. (A file the operator dropped in the inbox is used at once,
+            # above: it is exactly the workaround for a blocked IP, so it must not wait out the backoff.)
+            return StepView(StepStatus.NOT_STARTED, error_code=last_error)
+
         try:  # no DB transaction is open here
             if fetched is None:
                 fetched = ctx.subtitle_client.fetch(
@@ -326,6 +361,8 @@ class SourceStep(InlineStepHandler):
             return self._failed(ctx, project_id, "subtitles_unavailable", policy)
         except LanguageUnavailable:
             return self._failed(ctx, project_id, "language_unavailable", policy)
+        except SubtitleFetchFailed:                       # an odd video: permanent for THIS item, never an operator fault
+            return self._failed(ctx, project_id, "subtitle_failed", policy)
         except (BlockedByProvider, ProviderTimeout) as exc:
             code = "provider_timeout" if isinstance(exc, ProviderTimeout) else "provider_blocked"
             return self._transient(ctx, project_id, code, policy)
@@ -606,9 +643,11 @@ class StoryStep(_JobStep):
             return None
         cfg = dict(workflow_config(db, project).get("story") or {})
         story_cfg = {k: cfg.get(k) for k in ("branch", "direction", "target_length")}
-        if not story_cfg["target_length"]:  # default: at least as long as the reference story
+        story_cfg["target_length"] = coerce_target_length(story_cfg["target_length"])
+        if story_cfg["target_length"] is None:  # default: as long as the reference story (bounded, see the constant)
             try:
-                story_cfg["target_length"] = len(ctx.store.read(snap.meta["artifact_path"]).decode("utf-8").split())
+                words = len(ctx.store.read(snap.meta["artifact_path"]).decode("utf-8").split())
+                story_cfg["target_length"] = min(words, MAX_DEFAULT_TARGET) or None
             except (OSError, UnicodeDecodeError):
                 pass
         gen = None

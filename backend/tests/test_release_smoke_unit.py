@@ -26,7 +26,8 @@ def test_free_port_is_bindable_and_in_range():
 def test_registry_is_complete_and_unique():
     numbers = [s.number for s in rs.STEPS]
     ids = [s.id for s in rs.STEPS]
-    assert numbers == list(range(1, 13))
+    assert numbers == list(range(1, 14))
+    assert "batch" in ids
     assert len(set(ids)) == len(ids)
     assert all(callable(s.fn) for s in rs.STEPS)
     assert {s.id for s in rs.STEPS if s.needs_frontend} == {"frontend"}

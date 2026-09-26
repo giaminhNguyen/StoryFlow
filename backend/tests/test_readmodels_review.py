@@ -253,10 +253,37 @@ def test_preset_survives_the_json_round_trip(db, ctx):
     assert project["review"] == {
         "id": project["review"]["id"], "round_number": 1, "status": "completed", "verdict": "approve",
         "summary": "ok", "issue_count": 1, "issues": [{"aspect": "logic", "severity": "medium", "note": "gap"}],
-        "revised": False, "revised_version_id": None, "error_code": None}
+        "revised": False, "revised_version_id": None, "error_code": None, "rounds": 1}
     listed = to_jsonable(make_rm(ctx, ReviewStub()).list_workflows())
     assert listed[0]["preset"] == "balanced"
 
 
-def test_review_error_codes_are_business_failures():
-    assert categorize_error("invalid_review") == "business" == categorize_error("review_failed")
+@pytest.mark.parametrize("code", ["invalid_review", "bad_json", "no_json", "bad_verdict", "no_revised_story",
+                                  "bad_delimiter", "output_too_large", "output_truncated", "bad_path",
+                                  "bad_encoding", "invalid_envelope", "empty_result"])
+def test_review_error_codes_are_business_failures(code):
+    assert categorize_error(code) == "business"
+
+
+@pytest.mark.parametrize("code", ["cli_failed", "cli_error", "cli_not_found"])
+def test_cli_process_errors_are_infrastructure_failures(code):
+    assert categorize_error(code) == "infrastructure"
+
+
+def test_the_unused_review_failed_code_is_no_longer_classified():
+    assert categorize_error("review_failed") == "unknown"                       # nothing emits it
+
+
+def test_rounds_counts_every_review_row_while_the_latest_one_is_shown(db, ctx):
+    wf, p = make_project(db, config={"preset": "quality"})
+    v1, v2 = add_version(db, p, 1), add_version(db, p, 2)
+    add_review(db, p, v1, round_number=1, verdict="revise")
+    add_review(db, p, v2, round_number=2, verdict="approve")
+    review = make_rm(ctx, ReviewStub()).get_project(p.id).review
+    assert (review.round_number, review.rounds, review.verdict) == (2, 2, "approve")
+
+
+def test_a_project_with_one_review_has_one_round(db, ctx):
+    wf, p = make_project(db, config={"preset": "balanced"})
+    add_review(db, p, add_version(db, p, 1))
+    assert make_rm(ctx, ReviewStub()).get_project(p.id).review.rounds == 1

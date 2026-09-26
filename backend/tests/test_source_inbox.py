@@ -11,7 +11,7 @@ from storyflow.artifacts import ArtifactStore
 from storyflow.models import ChannelWorkflow, SourceSnapshot, StoryProject
 from storyflow.pipeline import PipelineContext, StepStatus
 from storyflow.providers import ProviderConfig, build_provider_stack, load_provider_config
-from storyflow.sources import YtDlpLister
+from storyflow.sources import MAX_INBOX_BYTES, YtDlpLister
 from storyflow.story_steps import SourceStep
 from storyflow.subtitles import BlockedByProvider, FakeSubtitleClient
 
@@ -162,8 +162,10 @@ def test_missing_local_file_ends_only_that_project_under_continue(db, session_fa
     assert (p.status, p.status_reason) == ("needs_attention", "inbox_file_missing")
 
 
-def test_a_non_utf8_inbox_file_is_ignored_for_video_sources(db, session_factory, store, inbox):
-    (inbox / f"{VID}.txt").write_bytes(b"\xff\xfe\xfa not utf8")
+def test_an_unreadable_inbox_file_is_ignored_for_video_sources(db, session_factory, store, inbox):
+    # too big to be read (independent of how encodings are detected): the provider is used and the snapshot is
+    # not labelled as coming from the inbox
+    (inbox / f"{VID}.txt").write_bytes(b"a" * (MAX_INBOX_BYTES + 1))
     client = Counting({VID: {"tracks": [track()]}})
     project = make_project(db, wf_config=VID_CONFIG)
     assert SourceStep().run(make_ctx(session_factory, store, client, inbox), project.id).status is StepStatus.COMPLETED

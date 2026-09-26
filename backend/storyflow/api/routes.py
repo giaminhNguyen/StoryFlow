@@ -176,7 +176,7 @@ def add_sources(request: Request, response: Response, workflow_id: PathId, body:
     result = c.sources.add_sources(workflow_id, body.sources, limit=body.limit, languages=body.languages,
                                    reprocess=body.reprocess, min_duration_seconds=body.min_duration_seconds)
     response.status_code = 201 if result.changed else 200
-    return {"result": to_jsonable(result), "workflow": to_jsonable(c.read.get_workflow(workflow_id))}
+    return {"result": to_jsonable(result), "workflow": c.sources.workflow_brief(workflow_id)}   # slim: batches are big
 
 
 @router.post("/workflows/{workflow_id}/sync")
@@ -184,7 +184,7 @@ def sync_sources(request: Request, workflow_id: PathId):
     """Re-scan the workflow's channels / playlists and add only videos not seen before."""
     c = _c(request)
     result = c.sources.sync_feeds(workflow_id)
-    return {"result": to_jsonable(result), "workflow": to_jsonable(c.read.get_workflow(workflow_id))}
+    return {"result": to_jsonable(result), "workflow": c.sources.workflow_brief(workflow_id)}
 
 
 @router.get("/workflows/{workflow_id}/feeds")

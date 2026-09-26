@@ -72,6 +72,12 @@ class BlockedByProvider(Exception):
     """The provider refused the request (IP blocked / rate limited / 429)."""
 
 
+class SubtitleFetchFailed(Exception):
+    """An unexpected upstream failure for THIS video (not a block, not a missing subtitle, and not an operator
+    problem such as a missing install). Permanent for the item; it must never look like an operator fault, or one
+    odd video (members-only, upcoming, ...) would pause a whole batch."""
+
+
 class ProviderUnavailable(Exception):
     """Provider not installed/misconfigured (worker python, deps or upstream dir missing).
     Permanent until an operator fixes the configuration."""
@@ -190,6 +196,42 @@ def import_external_subtitles(backend_dir: Path):
         ) from exc
 
 
+# Upstream (youtube-transcript-api) exception classes are matched by NAME along the MRO, so this module never
+# needs to import them. ``blocked`` wins over the others (IpBlocked derives from RequestBlocked).
+UPSTREAM_BLOCKED_NAMES = frozenset({"RequestBlocked", "IpBlocked", "YouTubeRequestFailed", "PoTokenRequired",
+                                    "TooManyRequests"})
+UPSTREAM_LANGUAGE_NAMES = frozenset({"NotTranslatable", "TranslationLanguageNotAvailable"})
+UPSTREAM_VIDEO_NAMES = frozenset({"VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId",
+                                  "TranscriptsDisabled", "NoTranscriptFound", "NoTranscriptAvailable"})
+
+
+def upstream_error_kind(exc: BaseException) -> str | None:
+    """"blocked" | "language_unavailable" | "video_unavailable" for a known upstream exception, else None."""
+    names = {c.__name__ for c in type(exc).__mro__}
+    if names & UPSTREAM_BLOCKED_NAMES:
+        return "blocked"
+    if names & UPSTREAM_LANGUAGE_NAMES:
+        return "language_unavailable"
+    if names & UPSTREAM_VIDEO_NAMES:
+        return "video_unavailable"
+    return None
+
+
+def _raise_unexpected(exc: Exception):
+    """Map an exception the adapter did not expect to the per-item StoryFlow error (never a bare crash)."""
+    kind = upstream_error_kind(exc)
+    text = f"{type(exc).__name__}"
+    if kind == "blocked":
+        raise BlockedByProvider(text) from exc
+    if kind == "language_unavailable":
+        raise LanguageUnavailable(text) from exc
+    if kind == "video_unavailable":
+        raise SubtitlesUnavailable(text) from exc
+    if isinstance(exc, OSError):  # connection / timeout errors are transient
+        raise ProviderTimeout(text) from exc
+    raise SubtitleFetchFailed(text) from exc
+
+
 class ExternalSubtitleClient(SubtitleClient):
     """Thin adapter over the external subtitle_suppervip services. The provider module
     is imported lazily so constructing this client costs nothing in tests that only
@@ -213,6 +255,8 @@ class ExternalSubtitleClient(SubtitleClient):
             raise BlockedByProvider(str(exc)) from exc
         except mod.SubtitleUnavailable as exc:
             raise SubtitlesUnavailable(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - adapter boundary: classify anything else per item
+            _raise_unexpected(exc)
         return [
             SubtitleTrack(t["language"], t["language_code"], t["is_generated"], t["is_translatable"])
             for t in tracks
@@ -230,6 +274,8 @@ class ExternalSubtitleClient(SubtitleClient):
             raise SubtitlesUnavailable(str(exc)) from exc
         except mod.BlockedByYouTube as exc:
             raise BlockedByProvider(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - adapter boundary: classify anything else per item
+            _raise_unexpected(exc)
         return FetchedSubtitle(
             language=transcript.language,
             language_code=transcript.language_code,

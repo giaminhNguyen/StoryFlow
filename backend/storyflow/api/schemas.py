@@ -91,7 +91,7 @@ class AddSourcesBody(_Body):
     """Links to expand into projects: videos, playlists, channels or ``inbox:<file>`` (see storyflow/sources.py)."""
 
     sources: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(min_length=1, max_length=50)
-    limit: int | None = Field(default=10, ge=1, le=1000)          # newest N videos per channel / playlist
+    limit: int = Field(default=10, ge=1, le=1000)                 # first N videos per channel / playlist (never "all")
     languages: list[Annotated[str, Field(min_length=1, max_length=16)]] | None = Field(
         default=None, min_length=1, max_length=8)
     reprocess: bool = False                                        # add videos even if they were processed before

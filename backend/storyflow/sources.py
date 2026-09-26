@@ -8,8 +8,9 @@ Accepted inputs (``parse_source``)::
     inbox:file.txt                                                                                        -> local file
 
 Listing a channel / playlist goes through a ``VideoLister`` (default ``YtDlpLister``: an isolated
-``python -m yt_dlp --flat-playlist`` subprocess, no API key, newest first). Nothing here touches the
-database. Local files are only ever read from the *inbox* directory (a bare file name, size-capped,
+``python -m yt_dlp --flat-playlist`` subprocess, no API key). A channel's uploads tab is newest first; a
+PLAYLIST comes back in playlist order (YouTube appends new items at the bottom), so "the first N" of a
+playlist are not the newest. Nothing here touches the database. Local files are only ever read from the *inbox* directory (a bare file name, size-capped,
 never a path) so an API caller cannot make StoryFlow read arbitrary files.
 
 Error codes (``SourceError.code``): ``invalid_source``, ``lister_unavailable`` (yt-dlp not installed),
@@ -19,13 +20,16 @@ Error codes (``SourceError.code``): ``invalid_source``, ``lister_unavailable`` (
 from __future__ import annotations
 
 import abc
+import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 VIDEO, PLAYLIST, CHANNEL, LOCAL = "video", "playlist", "channel", "local"
 FEED_KINDS = (PLAYLIST, CHANNEL)
@@ -69,6 +73,11 @@ class VideoRef:
 class ListedVideos:
     title: str | None
     videos: list[VideoRef] = field(default_factory=list)
+    partial: bool = False        # the listing ended with errors: the list may be cut short (never silently complete)
+
+
+def _only_dots(name: str) -> bool:
+    return set(name) <= {"."}
 
 
 def parse_source(text) -> ParsedSource:
@@ -85,7 +94,7 @@ def parse_source(text) -> ParsedSource:
         return ParsedSource(LOCAL, name, raw)
     if VIDEO_ID_RE.match(raw):
         return ParsedSource(VIDEO, raw, raw)
-    if _HANDLE_RE.match(raw):
+    if _HANDLE_RE.match(raw) and not _only_dots(raw[1:]):
         return ParsedSource(CHANNEL, f"https://www.youtube.com/{raw}", raw)
     candidate = raw if "://" in raw else "https://" + raw
     try:
@@ -93,7 +102,7 @@ def parse_source(text) -> ParsedSource:
     except ValueError:
         raise SourceError("invalid_source", "not a valid URL") from None
     host = (url.hostname or "").lower()
-    parts = [p for p in url.path.split("/") if p]
+    parts = [unquote(p) for p in url.path.split("/") if p]   # browsers copy @%E6%97%A5 for @日
     query = parse_qs(url.query)
     if host == "youtu.be":
         if parts and VIDEO_ID_RE.match(parts[0]):
@@ -113,11 +122,11 @@ def parse_source(text) -> ParsedSource:
         if _PLAYLIST_ID_RE.match(pid):
             return ParsedSource(PLAYLIST, pid, raw)
         raise SourceError("invalid_source", "playlist link has no list id")
-    if parts and parts[0].startswith("@") and _HANDLE_RE.match(parts[0]):
+    if parts and parts[0].startswith("@") and _HANDLE_RE.match(parts[0]) and not _only_dots(parts[0][1:]):
         return ParsedSource(CHANNEL, f"https://www.youtube.com/{parts[0]}", raw)
     if len(parts) >= 2 and parts[0] == "channel" and _CHANNEL_ID_RE.match(parts[1]):
         return ParsedSource(CHANNEL, f"https://www.youtube.com/channel/{parts[1]}", raw)
-    if len(parts) >= 2 and parts[0] in ("c", "user") and _NAME_RE.match(parts[1]):
+    if len(parts) >= 2 and parts[0] in ("c", "user") and _NAME_RE.match(parts[1]) and not _only_dots(parts[1]):
         return ParsedSource(CHANNEL, f"https://www.youtube.com/{parts[0]}/{parts[1]}", raw)
     raise SourceError("invalid_source", "unsupported YouTube link (use a video, playlist or channel link)")
 
@@ -127,8 +136,13 @@ def parse_source(text) -> ParsedSource:
 
 class VideoLister(abc.ABC):
     @abc.abstractmethod
-    def list_videos(self, source: ParsedSource, limit: int | None) -> ListedVideos:
-        """Newest-first videos of a channel/playlist (at most ``limit`` when given). Raises SourceError."""
+    def list_videos(self, source: ParsedSource, limit: int | None, timeout: float | None = None) -> ListedVideos:
+        """Videos of a channel/playlist (at most ``limit`` when given; a channel newest first, a playlist in
+        playlist order). ``timeout`` (seconds) caps THIS call below the lister's own default. Raises SourceError."""
+
+
+LISTER_MAX_CONCURRENT = 2
+_LISTER_SLOTS = threading.BoundedSemaphore(LISTER_MAX_CONCURRENT)   # process-wide: yt-dlp is heavy, YouTube throttles
 
 
 class YtDlpLister(VideoLister):
@@ -147,45 +161,81 @@ class YtDlpLister(VideoLister):
             return f"https://www.youtube.com/playlist?list={source.ref}"
         raise SourceError("invalid_source", "only channels and playlists can be listed")
 
+    # One JSON object per entry: a title can contain tabs / newlines but can never forge a second row.
+    PRINT_TEMPLATE = "%(.{id,duration,playlist_title,title})j"
+
     def argv(self, source: ParsedSource, limit: int | None) -> list[str]:
-        cmd = [self.python, "-m", "yt_dlp", "--flat-playlist", "--no-warnings", "--ignore-errors"]
+        # --ignore-config: a user's yt-dlp.conf (--playlist-reverse, --match-filter, --proxy ...) must not change
+        # what we list; --no-cache-dir: never write next to the user's files.
+        cmd = [self.python, "-m", "yt_dlp", "--flat-playlist", "--no-warnings", "--ignore-errors",
+               "--ignore-config", "--no-cache-dir", "--socket-timeout", "20", "--extractor-retries", "2"]
         if limit:
             cmd += ["--playlist-end", str(int(limit))]
-        cmd += ["--print", "%(id)s\t%(duration)s\t%(playlist_title)s\t%(title)s", self.url_for(source)]
+        cmd += ["--print", self.PRINT_TEMPLATE, self.url_for(source)]
         return cmd
 
-    def list_videos(self, source: ParsedSource, limit: int | None) -> ListedVideos:
+    def list_videos(self, source: ParsedSource, limit: int | None, timeout: float | None = None) -> ListedVideos:
         cmd = self.argv(source, limit)
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
+        budget = self.timeout if timeout is None else max(0.001, min(self.timeout, float(timeout)))
+        started = time.monotonic()
+        if not _LISTER_SLOTS.acquire(timeout=budget):
+            raise SourceError("lister_timeout", "other channel listings are still running; try again later")
         try:
-            done = self._run(cmd, capture_output=True, timeout=self.timeout, env=env, stdin=subprocess.DEVNULL)
+            done = self._run(cmd, capture_output=True, timeout=max(0.001, budget - (time.monotonic() - started)),
+                             env=env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise SourceError("lister_timeout", "listing the channel timed out; try again later") from None
         except OSError:
             raise SourceError("lister_unavailable", "cannot start the channel lister (check STORYFLOW_YTDLP_PYTHON)") \
                 from None
+        finally:
+            _LISTER_SLOTS.release()
         stdout = done.stdout.decode("utf-8", "replace") if isinstance(done.stdout, bytes) else (done.stdout or "")
         stderr = done.stderr.decode("utf-8", "replace") if isinstance(done.stderr, bytes) else (done.stderr or "")
         if "No module named yt_dlp" in stderr:
             raise SourceError("lister_unavailable",
                               "yt-dlp is not installed: pip install -r backend/requirements-channel.txt")
         listed = parse_lister_output(stdout)
+        failed = done.returncode != 0 or "ERROR" in stderr
         if not listed.videos:
-            if done.returncode != 0 or "ERROR" in stderr:
+            if failed:
                 raise SourceError("lister_failed", "could not list videos (channel not found, private or blocked)")
+        elif failed:
+            listed.partial = True   # e.g. a 429 / network drop half way: what we have may be cut short
         return listed
 
 
+def _json_row(line: str):
+    """(id, duration, playlist_title, title) of one JSON line printed by yt-dlp, or None."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    text = lambda v: v if isinstance(v, str) else ("NA" if v is None else str(v))   # noqa: E731
+    return (text(obj.get("id")).strip(), text(obj.get("duration")), text(obj.get("playlist_title")).strip(),
+            text(obj.get("title")).strip())
+
+
 def parse_lister_output(stdout: str) -> ListedVideos:
-    """Parse ``id<TAB>duration<TAB>playlist_title<TAB>title`` lines; ignore private/deleted/malformed rows."""
+    """Parse the lister output: one JSON object per line (``{"id", "duration", "playlist_title", "title"}``) or the
+    older ``id<TAB>duration<TAB>playlist_title<TAB>title`` lines; ignore private/deleted/malformed rows."""
     videos: list[VideoRef] = []
     seen: set[str] = set()
     title = None
     for line in stdout.split("\n"):   # not splitlines(): U+2028 / NEL inside a video title must not cut the row
-        cols = line.split("\t", 3)
-        if len(cols) < 4:
-            continue
-        video_id, duration, playlist_title, video_title = (c.strip() for c in cols)
+        if line.lstrip().startswith("{"):
+            row = _json_row(line)
+            if row is None:
+                continue
+            video_id, duration, playlist_title, video_title = row
+        else:
+            cols = line.split("\t", 3)
+            if len(cols) < 4:
+                continue
+            video_id, duration, playlist_title, video_title = (c.strip() for c in cols)
         if not VIDEO_ID_RE.match(video_id) or video_id in seen:
             continue
         if video_title.lower() in ("[private video]", "[deleted video]", "[unavailable video]"):
@@ -212,9 +262,11 @@ class FakeVideoLister(VideoLister):
     def __init__(self, store: dict | None = None):
         self.store = store or {}
         self.calls: list[tuple[str, str, int | None]] = []
+        self.timeouts: list[float | None] = []      # the per-call time budget the caller allowed
 
-    def list_videos(self, source: ParsedSource, limit: int | None) -> ListedVideos:
+    def list_videos(self, source: ParsedSource, limit: int | None, timeout: float | None = None) -> ListedVideos:
         self.calls.append((source.kind, source.ref, limit))
+        self.timeouts.append(timeout)
         entry = self.store.get(source.ref)
         if entry is None:
             raise SourceError("lister_failed", "could not list videos (channel not found, private or blocked)")
@@ -298,16 +350,42 @@ def subtitle_text_to_plain(text: str) -> str:
     return "\n".join(out)
 
 
+def decode_inbox_bytes(raw: bytes) -> str | None:
+    """Text of an inbox file saved by any common Windows / Unicode editor, or None when it is not text.
+
+    UTF-8 (with or without BOM) first; a UTF-16 BOM (Notepad's "Unicode") next; cp1252 last (old ANSI files).
+    Binary junk (NUL bytes / many control characters) is refused whatever encoding would accept it."""
+    text = None
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            text = raw.decode("utf-16")
+        except UnicodeDecodeError:
+            text = None
+    if text is None:
+        for encoding in ("utf-8-sig", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+    if text is None or "\x00" in text:
+        return None
+    controls = sum(1 for ch in text if ch < " " and ch not in "\t\n\r\f")
+    return None if controls > max(2, len(text) // 100) else text
+
+
 def read_inbox_text(inbox_dir, name: str) -> str | None:
-    """Plain text of an inbox file, or None when it does not exist / is unsafe / too big / not UTF-8."""
+    """Plain text of an inbox file, or None when it does not exist / is unsafe / too big / not text."""
     path = _resolve_inbox_file(inbox_dir, name)
     if path is None:
         return None
     try:
         if path.stat().st_size > MAX_INBOX_BYTES:
             return None
-        raw = path.read_bytes().decode("utf-8-sig")
-    except (OSError, UnicodeDecodeError):
+        raw = decode_inbox_bytes(path.read_bytes())
+    except OSError:
+        return None
+    if raw is None:
         return None
     if path.suffix.lower() in (".srt", ".vtt"):
         return subtitle_text_to_plain(raw)

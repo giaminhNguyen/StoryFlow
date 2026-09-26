@@ -310,7 +310,8 @@ class SourceFeed(Base):
     kind: Mapped[str] = mapped_column(String(16))            # channel | playlist
     ref: Mapped[str] = mapped_column(String(512))            # canonical channel URL | playlist id
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    limit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)   # newest N per scan (None = all)
+    limit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)   # first N videos of the first scan
+    min_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)   # 0009: kept for every re-scan
     languages: Mapped[list | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="active")         # active | error
     known_count: Mapped[int] = mapped_column(Integer, default=0)

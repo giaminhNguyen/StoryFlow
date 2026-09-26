@@ -52,6 +52,10 @@ class ScanClient(TestClient):
 def rt(tmp_path):
     app = make_runtime(tmp_path, sleep=lambda s: None)
     app.ctx.video_lister = FakeVideoLister({CHANNEL: ("Demo", refs(1, 2, 3, 4, 5))})
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "my story.txt").write_text("Một dòng lời thoại.", encoding="utf-8")
+    app.ctx.inbox_dir = inbox
     yield app
     app.close()
 
@@ -70,8 +74,14 @@ def post_sources(client, wf, **body):
     return client.post(f"/api/workflows/{wf}/sources", json=body)
 
 
-def titles(resp):
-    return [p["title"] for p in resp.json()["workflow"]["projects"]]
+def projects_of(client, resp):
+    """The workflow's projects: the sources / sync responses carry only a slim workflow view (a big batch must not
+    come back as a megabyte of snapshot), so read the full snapshot separately."""
+    return client.get(f"/api/workflows/{resp.json()['workflow']['id']}").json()["projects"]
+
+
+def titles(client, resp):
+    return [p["title"] for p in projects_of(client, resp)]
 
 
 # ---------------------------------------------------------------- videos
@@ -83,10 +93,10 @@ def test_add_a_video_link_creates_one_project(client, wf):
     body = r.json()
     assert body["result"]["changed"] is True and body["result"]["workflow_id"] == wf
     assert [a["video_id"] for a in body["result"]["added"]] == ["AAAAAAAAAAA"]
-    (project,) = body["workflow"]["projects"]
+    (project,) = projects_of(client, r)
     assert project["video_id"] == "AAAAAAAAAAA" and project["state"] == "not_started"
     assert project["title"] == "YouTube AAAAAAAAAAA" and project["feed_id"] is None
-    assert body["workflow"]["counts"]["not_started"] == 1
+    assert client.get(f"/api/workflows/{wf}").json()["counts"]["not_started"] == 1
 
 
 def test_repeating_the_same_video_is_a_safe_noop(client, wf):
@@ -96,7 +106,7 @@ def test_repeating_the_same_video_is_a_safe_noop(client, wf):
     result = again.json()["result"]
     assert result["changed"] is False and result["added"] == []
     assert [(d["video_id"], d["reason"]) for d in result["duplicates"]] == [("AAAAAAAAAAA", "in_workflow")]
-    assert len(again.json()["workflow"]["projects"]) == 1
+    assert len(projects_of(client, again)) == 1
 
 
 def test_same_video_twice_in_one_request_is_added_once(client, wf):
@@ -109,8 +119,8 @@ def test_same_video_twice_in_one_request_is_added_once(client, wf):
 def test_reprocess_adds_the_video_again(client, wf):
     post_sources(client, wf, sources=["AAAAAAAAAAA"])
     r = post_sources(client, wf, sources=["AAAAAAAAAAA"], reprocess=True)
-    assert r.status_code == 201 and len(r.json()["workflow"]["projects"]) == 2
-    slugs = {p["slug"] for p in r.json()["workflow"]["projects"]}
+    assert r.status_code == 201 and len(projects_of(client, r)) == 2
+    slugs = {p["slug"] for p in projects_of(client, r)}
     assert len(slugs) == 2
 
 
@@ -121,7 +131,7 @@ def test_video_already_processed_in_another_workflow_is_reported(client, wf):
     assert r.status_code == 200
     (dup,) = r.json()["result"]["duplicates"]
     assert dup["reason"] == "already_processed" and dup["project_id"]
-    assert r.json()["workflow"]["projects"] == []
+    assert projects_of(client, r) == []
 
 
 def test_languages_are_stored_on_the_new_projects(client, rt, wf):
@@ -134,7 +144,7 @@ def test_languages_are_stored_on_the_new_projects(client, rt, wf):
 def test_inbox_source_creates_a_local_project_once(client, wf):
     r = post_sources(client, wf, sources=["inbox:my story.txt"])
     assert r.status_code == 201
-    (project,) = r.json()["workflow"]["projects"]
+    (project,) = projects_of(client, r)
     assert project["video_id"] is None and project["title"] == "my story"
     again = post_sources(client, wf, sources=["inbox:my story.txt"])
     assert again.status_code == 200 and again.json()["result"]["duplicates"][0]["video_id"] is None
@@ -146,12 +156,12 @@ def test_inbox_source_creates_a_local_project_once(client, wf):
 def test_channel_honours_limit_and_keeps_listing_order(client, rt, wf):
     r = post_sources(client, wf, sources=[CHANNEL], limit=3)
     assert r.status_code == 201, r.text
-    assert titles(r) == ["Video 1", "Video 2", "Video 3"]                  # newest first, as listed
+    assert titles(client, r) == ["Video 1", "Video 2", "Video 3"]                  # newest first, as listed
     (feed,) = r.json()["result"]["feeds"]
     assert (feed["kind"], feed["ref"], feed["title"], feed["listed"], feed["added"], feed["known"]) == (
         "channel", CHANNEL, "Demo", 3, 3, 3)
     assert rt.ctx.video_lister.calls == [("channel", CHANNEL, 3)]
-    assert {p["feed_id"] for p in r.json()["workflow"]["projects"]} == {feed["id"]}
+    assert {p["feed_id"] for p in projects_of(client, r)} == {feed["id"]}
 
 
 def test_default_limit_is_ten(client, rt, wf):
@@ -179,13 +189,13 @@ def test_min_duration_filters_out_short_videos(client, rt, wf):
     rt.ctx.video_lister.store[CHANNEL] = ("Demo", [VideoRef(vid(1), "long", 900), VideoRef(vid(2), "short", 30),
                                                   VideoRef(vid(3), "unknown", None)])
     r = post_sources(client, wf, sources=[CHANNEL], min_duration_seconds=60)
-    assert titles(r) == ["long", "unknown"]
+    assert titles(client, r) == ["long", "unknown"]
 
 
 def test_playlist_source_is_listed_too(client, rt, wf):
     rt.ctx.video_lister.store["PLabcdefghijk"] = ("My list", refs(7, 8))
     r = post_sources(client, wf, sources=["https://www.youtube.com/playlist?list=PLabcdefghijk"])
-    assert r.status_code == 201 and titles(r) == ["Video 7", "Video 8"]
+    assert r.status_code == 201 and titles(client, r) == ["Video 7", "Video 8"]
     (feed,) = client.get(f"/api/workflows/{wf}/feeds").json()["feeds"]
     assert (feed["kind"], feed["ref"], feed["title"]) == ("playlist", "PLabcdefghijk", "My list")
 
@@ -206,12 +216,13 @@ def test_sync_adds_only_videos_the_ledger_has_not_seen(client, rt, wf):
     r = client.post(f"/api/workflows/{wf}/sync")
     assert r.status_code == 200, r.text
     result = r.json()["result"]
-    assert result["changed"] is True and [a["title"] for a in result["added"]] == ["Video 9"]
-    assert sorted(d["reason"] for d in result["duplicates"]) == ["in_workflow", "in_workflow"]
-    assert rt.ctx.video_lister.calls[-1] == ("channel", CHANNEL, 3)             # same newest-N window as the feed
-    assert len(r.json()["workflow"]["projects"]) == 4
+    # a re-scan looks at a wider window than the first add (limit x 3, at least 50): everything unseen is picked up
+    assert result["changed"] is True and [a["title"] for a in result["added"]] == ["Video 9", "Video 4", "Video 5"]
+    assert sorted(d["reason"] for d in result["duplicates"]) == ["in_workflow"] * 3
+    assert rt.ctx.video_lister.calls[-1] == ("channel", CHANNEL, 50)
+    assert len(projects_of(client, r)) == 6
     (feed,) = client.get(f"/api/workflows/{wf}/feeds").json()["feeds"]
-    assert feed["known_count"] == 4
+    assert feed["known_count"] == 6
     quiet = client.post(f"/api/workflows/{wf}/sync")                             # nothing new: harmless
     assert quiet.status_code == 200 and quiet.json()["result"]["changed"] is False
 
@@ -221,7 +232,7 @@ def test_sync_without_feeds_is_a_noop(client, wf):
     r = client.post(f"/api/workflows/{wf}/sync")
     assert r.status_code == 200
     assert r.json()["result"]["changed"] is False and r.json()["result"]["feeds"] == []
-    assert len(r.json()["workflow"]["projects"]) == 1
+    assert len(projects_of(client, r)) == 1
 
 
 def test_sync_reports_a_feed_that_cannot_be_listed_and_marks_it(client, rt, wf):
@@ -233,7 +244,7 @@ def test_sync_reports_a_feed_that_cannot_be_listed_and_marks_it(client, rt, wf):
     assert err["source"] == CHANNEL and err["code"] == "source_unreadable"
     (feed,) = client.get(f"/api/workflows/{wf}/feeds").json()["feeds"]
     assert feed["status"] == "error" and "could not list" in feed["last_error"]
-    assert len(r.json()["workflow"]["projects"]) == 3                             # nothing was lost
+    assert len(projects_of(client, r)) == 3                             # nothing was lost
 
 
 # ---------------------------------------------------------------- validation (422)
@@ -248,6 +259,7 @@ def test_sync_reports_a_feed_that_cannot_be_listed_and_marks_it(client, rt, wf):
     {"sources": [5]},
     {"sources": "AAAAAAAAAAA"},
     {"sources": ["AAAAAAAAAAA"], "limit": 0},
+    {"sources": ["AAAAAAAAAAA"], "limit": None},                # "everything" is never a legal request
     {"sources": ["AAAAAAAAAAA"], "limit": 1001},
     {"sources": ["AAAAAAAAAAA"], "limit": "ten"},
     {"sources": ["AAAAAAAAAAA"], "languages": []},
@@ -326,3 +338,37 @@ def test_new_source_projects_run_like_any_project_after_start(client, wf):
     post_sources(client, wf, sources=["AAAAAAAAAAA"])
     snap = client.post(f"/api/workflows/{wf}/start").json()["workflow"]
     assert snap["status"] == "active" and snap["projects"][0]["video_id"] == "AAAAAAAAAAA"
+
+
+# ---------------------------------------------------------------- the slim workflow view
+
+
+BRIEF_KEYS = {"id", "name", "status", "status_reason", "project_count", "counts"}
+
+
+def test_sources_and_sync_responses_carry_a_slim_workflow_view(client, rt, wf):
+    r = post_sources(client, wf, sources=[CHANNEL], limit=3)
+    brief = r.json()["workflow"]
+    assert set(brief) == BRIEF_KEYS and "projects" not in brief and "runners" not in brief
+    assert brief["id"] == wf and brief["project_count"] == 3 and brief["counts"] == {"active": 3}
+    rt.ctx.video_lister.store[CHANNEL] = ("Demo", refs(9, 1, 2, 3, 4, 5))
+    synced = client.post(f"/api/workflows/{wf}/sync").json()["workflow"]
+    assert set(synced) == BRIEF_KEYS and synced["project_count"] == 6
+
+
+def test_a_big_batch_response_stays_small(client, rt, wf):
+    rt.ctx.video_lister.store[CHANNEL] = ("Demo", refs(*range(1, 201)))
+    r = post_sources(client, wf, sources=[CHANNEL], limit=200)
+    assert r.status_code == 201 and len(r.json()["result"]["added"]) == 200
+    assert len(r.json()["workflow"]) == len(BRIEF_KEYS)
+    assert r.json()["workflow"]["project_count"] == 200
+    full = client.get(f"/api/workflows/{wf}")
+    assert len(r.content) < len(full.content) / 2                    # the snapshot is what made responses huge
+
+
+def test_a_truncated_call_says_so_in_the_result(client, rt, wf):
+    rt.ctx.video_lister.store[CHANNEL] = ("Demo", refs(*range(1, 6)))
+    r = post_sources(client, wf, sources=[CHANNEL], limit=5)
+    result = r.json()["result"]
+    assert result["truncated"] is False and result["not_added"] == 0 and result["warnings"] == []
+    assert result["duplicates_count"] == 0 and result["feeds"][0]["window_full"] is True

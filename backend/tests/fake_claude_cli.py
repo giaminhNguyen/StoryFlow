@@ -88,6 +88,8 @@ def main():
         return 0
     if mode == "success":
         out.write(envelope(json.dumps(CANON) if is_canon else story))
+    elif mode == "truncated":   # the model ran out of output room: a cut-off answer with stop_reason max_tokens
+        out.write(envelope(json.dumps(CANON) if is_canon else story, stop_reason="max_tokens"))
     elif mode == "fenced":
         out.write(envelope("Here you go:\n```json\n" + json.dumps(CANON) + "\n```" if is_canon
                            else "```markdown\n" + STORY + "\n```"))

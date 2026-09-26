@@ -222,3 +222,69 @@ def test_bodies_never_contain_absolute_paths(env):
         r = env.client.get("/api/artifacts/" + rel)
         assert str(env.tmp) not in r.text and str(env.root) not in r.text
         assert str(env.root).replace("\\", "/") not in r.text
+
+
+# --- size caps: audio (long final.wav) vs text --------------------------------------------------
+
+
+def test_default_caps_give_audio_far_more_room_than_text():
+    from storyflow.api.artifacts import DEFAULT_AUDIO_MAX_BYTES, DEFAULT_MAX_BYTES, size_cap
+    state = types.SimpleNamespace()
+    assert size_cap(state, ".md") == DEFAULT_MAX_BYTES == 256 * 1024 * 1024
+    for suffix in (".wav", ".WAV", ".mp3", ".ogg", ".flac", ".m4a"):
+        assert size_cap(state, suffix) == DEFAULT_AUDIO_MAX_BYTES == 4 * 1024 ** 3
+    # a one-hour 48 kHz / 16-bit mono story (~346 MB) is above the text cap but well inside the audio cap
+    hour = 3600 * 48000 * 2
+    assert DEFAULT_MAX_BYTES < hour < DEFAULT_AUDIO_MAX_BYTES
+
+
+def test_size_cap_precedence_and_env(monkeypatch):
+    from storyflow.api.artifacts import size_cap
+    monkeypatch.delenv("STORYFLOW_AUDIO_MAX_MB", raising=False)
+    monkeypatch.delenv("STORYFLOW_ARTIFACT_MAX_MB", raising=False)
+    monkeypatch.setenv("STORYFLOW_AUDIO_MAX_MB", "700")
+    monkeypatch.setenv("STORYFLOW_ARTIFACT_MAX_MB", "5")
+    assert size_cap(types.SimpleNamespace(), ".wav") == 700 * 1024 * 1024
+    assert size_cap(types.SimpleNamespace(), ".txt") == 5 * 1024 * 1024
+    # an explicit app cap beats the environment, and also caps audio unless audio_max_bytes is set too
+    assert size_cap(types.SimpleNamespace(artifact_max_bytes=10), ".txt") == 10
+    assert size_cap(types.SimpleNamespace(artifact_max_bytes=10), ".wav") == 10
+    assert size_cap(types.SimpleNamespace(artifact_max_bytes=10, audio_max_bytes=99), ".wav") == 99
+    assert size_cap(types.SimpleNamespace(audio_max_bytes=99), ".txt") == 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "0", "-5", "1.5", "99999999999", " "])
+def test_invalid_env_caps_are_ignored(monkeypatch, bad):
+    from storyflow.api.artifacts import DEFAULT_AUDIO_MAX_BYTES, DEFAULT_MAX_BYTES, size_cap
+    monkeypatch.setenv("STORYFLOW_AUDIO_MAX_MB", bad)
+    monkeypatch.setenv("STORYFLOW_ARTIFACT_MAX_MB", bad)
+    assert size_cap(types.SimpleNamespace(), ".wav") == DEFAULT_AUDIO_MAX_BYTES
+    assert size_cap(types.SimpleNamespace(), ".txt") == DEFAULT_MAX_BYTES
+
+
+def test_audio_is_served_above_the_text_cap(env):
+    env.app.state.artifact_max_bytes = 5           # tiny text cap
+    env.app.state.audio_max_bytes = 10 * len(WAV)  # roomy audio cap
+    assert env.client.get("/api/artifacts/projects/p1/story/g1/story.md").status_code == 422
+    r = env.client.get("/api/artifacts/projects/p1/audio/t1/run-001/0001.wav")
+    assert r.status_code == 200 and r.content == WAV
+
+
+def test_range_requests_still_work_for_long_audio(env):
+    env.app.state.audio_max_bytes = 10 * len(WAV)
+    r = env.client.get("/api/artifacts/projects/p1/audio/t1/run-001/0001.wav", headers={"Range": "bytes=4-11"})
+    assert r.status_code == 206 and r.content == WAV[4:12]
+    assert r.headers["content-range"] == f"bytes 4-11/{len(WAV)}"
+    assert r.headers["accept-ranges"] == "bytes"
+
+
+def test_env_audio_cap_refuses_and_allows(env, monkeypatch):
+    big = b"RIFF" + bytes(1024 * 1024 + 4096)      # just over 1 MB
+    env.store.write("projects/p1/audio/t1/run-001/final.wav", big)
+    url = "/api/artifacts/projects/p1/audio/t1/run-001/final.wav"
+    monkeypatch.setenv("STORYFLOW_AUDIO_MAX_MB", "1")
+    assert env.client.get(url).status_code == 422
+    monkeypatch.setenv("STORYFLOW_AUDIO_MAX_MB", "2")
+    assert env.client.get(url).status_code == 200
+    monkeypatch.delenv("STORYFLOW_AUDIO_MAX_MB")
+    assert env.client.get(url).status_code == 200   # default (4 GiB) serves it

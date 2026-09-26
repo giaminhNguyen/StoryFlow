@@ -8,8 +8,12 @@ Contract (stable):
     hidden/temp name, disallowed extension, symlink escape -- is the SAME response:
     404 ``not_found`` "not found" with empty details. Nothing is echoed (no path, root, OS text),
     so attack attempts are indistinguishable from an ordinary miss and the layout cannot be probed.
-  * The only distinct refusal is a file above the size cap: 422 ``validation`` "artifact too large"
-    (cap = ``app.state.artifact_max_bytes`` if set, else DEFAULT_MAX_BYTES = 256 MB).
+  * The only distinct refusal is a file above the size cap: 422 ``validation`` "artifact too large".
+    Text-like artifacts are capped at DEFAULT_MAX_BYTES = 256 MB; AUDIO files (.wav .mp3 .ogg .flac .m4a, e.g.
+    the joined ``final.wav`` of a long story: ~345 MB per hour at 48 kHz / 16 bit) at DEFAULT_AUDIO_MAX_BYTES = 4 GiB.
+    Both are configurable: ``app.state.audio_max_bytes`` / ``app.state.artifact_max_bytes`` (tests), else the env vars
+    ``STORYFLOW_AUDIO_MAX_MB`` / ``STORYFLOW_ARTIFACT_MAX_MB`` (whole megabytes; invalid values are ignored). An
+    explicit ``artifact_max_bytes`` on the app also applies to audio unless ``audio_max_bytes`` is set as well.
   * Textual checks run BEFORE any filesystem access; the filesystem is then only touched through
     ArtifactStore.resolve (Phase 3 root-escape protection) plus a regular-file check.
   * Content-Type comes from a fixed extension map (never sniffed); ``nosniff``, inline disposition
@@ -17,6 +21,7 @@ Contract (stable):
     starlette FileResponse (streamed from disk, never read whole into memory).
 """
 
+import os
 import re
 from pathlib import PurePosixPath
 
@@ -29,6 +34,8 @@ from ..errors import NotFound, ValidationFailed
 router = APIRouter()
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+DEFAULT_AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024
+AUDIO_SUFFIXES = frozenset({".wav", ".mp3", ".ogg", ".flac", ".m4a"})
 MAX_PATH_LENGTH = 512
 
 CONTENT_TYPES = {
@@ -46,6 +53,29 @@ CONTENT_TYPES = {
 # letters/digits/._- only. This excludes ":", "\\", "%", NUL/control chars, spaces, "~" etc.
 _SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _env_megabytes(name: str) -> int | None:
+    """Whole megabytes from the environment as bytes; None when unset, not a positive integer or absurd."""
+    raw = os.environ.get(name, "").strip()
+    if not raw.isdigit() or not 0 < int(raw) <= 1_048_576:     # up to 1 TiB
+        return None
+    return int(raw) * 1024 * 1024
+
+
+def size_cap(state, suffix: str) -> int:
+    """Largest servable size for a file with this extension (see the module docstring for the precedence)."""
+    text_cap = getattr(state, "artifact_max_bytes", None)
+    if suffix.lower() in AUDIO_SUFFIXES:
+        audio_cap = getattr(state, "audio_max_bytes", None)
+        if audio_cap is not None:
+            return audio_cap
+        if text_cap is not None:                     # an explicit app-wide cap applies to audio too
+            return text_cap
+        return _env_megabytes("STORYFLOW_AUDIO_MAX_MB") or DEFAULT_AUDIO_MAX_BYTES
+    if text_cap is not None:
+        return text_cap
+    return _env_megabytes("STORYFLOW_ARTIFACT_MAX_MB") or DEFAULT_MAX_BYTES
 
 
 def _etag_matches(header: str | None, etag: str) -> bool:
@@ -96,8 +126,7 @@ def get_artifact(rel_path: str, request: Request):
         raise _not_found()
     if target.suffix.lower() not in CONTENT_TYPES:  # symlink to a different extension
         raise _not_found()
-    cap = getattr(request.app.state, "artifact_max_bytes", DEFAULT_MAX_BYTES)
-    if stat.st_size > cap:
+    if stat.st_size > size_cap(request.app.state, target.suffix):
         raise ValidationFailed("artifact too large")
     etag = f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"'
     if _etag_matches(request.headers.get("if-none-match"), etag):

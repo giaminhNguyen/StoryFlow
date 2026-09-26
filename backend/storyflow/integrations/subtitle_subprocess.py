@@ -23,6 +23,7 @@ from ..subtitles import (
     ProviderTimeout,
     ProviderUnavailable,
     SubtitleClient,
+    SubtitleFetchFailed,
     SubtitleSnippet,
     SubtitlesUnavailable,
     SubtitleTrack,
@@ -118,6 +119,10 @@ class SubprocessSubtitleClient(SubtitleClient):
             raise BlockedByProvider("subtitle provider blocked the request")
         if error == "no_subtitle":
             raise SubtitlesUnavailable("no subtitle for this video")
+        if error == "video_unavailable":  # private / deleted / age-restricted / not playable: nothing to fetch
+            raise SubtitlesUnavailable("video is unavailable (private, removed, age-restricted or not playable)")
+        if error == "subtitle_failed":  # unexpected upstream failure for this one video: permanent for the item
+            raise SubtitleFetchFailed("subtitle provider failed for this video")
         if error == "language_unavailable":
             raise LanguageUnavailable("requested subtitle language unavailable")
         if error == "network":  # transient connectivity problem upstream: retry later, not an operator fix

@@ -79,20 +79,29 @@ One workflow can hold many videos. Send sources to `POST /api/workflows/{id}/sou
 | Source | Result |
 |---|---|
 | video link / bare 11-char id (`watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`) | one project |
-| playlist (`playlist?list=`) or channel (`/@handle`, `/channel/UC...`, `/c/name`, `/user/name`) | the **newest `limit` videos** (default 10, max 1000), newest first; the feed is remembered |
+| playlist (`playlist?list=`) or channel (`/@handle`, `/channel/UC...`, `/c/name`, `/user/name`) | up to `limit` videos (1..1000, default 10; `null` is refused); a channel lists the **newest** first, a playlist lists its **first N in playlist order**; the feed is remembered |
 | `inbox:file.txt` | one project read from a subtitle file you put in `runtime\inbox\` (`.txt`, `.srt`, `.vtt`) |
 
 * **Every video is processed once (ledger).** A video that already has a project in this workflow, or in any
-  workflow that was not cancelled, is reported under `duplicates` (`in_workflow`, `already_processed`, `repeated`) and
-  not added again. Send `"reprocess": true` to add it anyway.
+  workflow that was not cancelled (including workflows created from the UI with `source.video_id`), is reported under
+  `duplicates` (`in_workflow`, `already_processed`, `repeated`) and not added again. Send `"reprocess": true` to add it anyway.
+* **Size limits.** One call creates at most 1000 projects; the rest is reported (`truncated: true`, `not_added`) and the next
+  call picks it up through the ledger. The response carries a small `workflow` summary (`id`, `status`, `project_count`,
+  `counts`); read `GET /api/workflows/{id}` for the full snapshot. Listing is bounded (300 s per call, at most 2 yt-dlp
+  processes at a time).
 * `POST /api/workflows/{id}/sync` re-scans the stored channels / playlists and adds only videos not seen before
-  (`known_count` and `last_scanned_at` are the cursor); `GET /api/workflows/{id}/feeds` lists them. Adding to a
-  finished workflow re-opens it. A feed that cannot be listed is marked `error` and the other feeds still sync.
+  (`known_count` and `last_scanned_at` are the cursor; the feed's `limit` and `min_duration_seconds` are remembered and
+  a wider window than the first add is scanned so videos published in between are not lost).
+  `GET /api/workflows/{id}/feeds` lists the feeds. Every feed report says `window_full` (the listing returned as many
+  videos as asked: older videos may exist), `partial` (yt-dlp failed part-way; also a `partial_listing` entry in `warnings`)
+  and `order`. Adding to a finished workflow re-opens it. A feed that cannot be listed is marked `error` and the others still sync.
 * Channel / playlist links need `yt-dlp` (`backend\requirements-channel.txt`, installed by `setup.bat`; no API key).
-  Video links and inbox files work without it. Settings: `STORYFLOW_YTDLP_PYTHON`, `STORYFLOW_LISTER_TIMEOUT`.
-* **Inbox** (`STORYFLOW_INBOX_DIR`, default `runtime\inbox`): a file named `<video_id>.txt|srt|vtt` is used instead of
-  asking YouTube (handy when YouTube blocks your IP or a video has no subtitles); `inbox:name.txt` adds a project from
-  a file that has no video at all. Only plain file names inside that folder are ever read.
+  Video links and inbox files work without it. Settings: `STORYFLOW_YTDLP_PYTHON`, `STORYFLOW_LISTER_TIMEOUT`
+  (an invalid value falls back to 120 s and is reported by `doctor`).
+* **Inbox** (`STORYFLOW_INBOX_DIR`, default `runtime\inbox`, created automatically): a file named `<video_id>.txt|srt|vtt`
+  is used instead of asking YouTube, even while a retry is waiting (handy when YouTube blocks your IP or a video has no
+  subtitles); `inbox:name.txt` adds a project from a file that has no video at all (checked when you add it; a missing or
+  unreadable file is a `422`). Files may be UTF-8, UTF-16 (BOM) or Windows cp1252. Only plain file names inside that folder are read.
 * Videos are picked up in listing order. For a batch use `"failure_policy": {"on_no_subtitle": "skip",
   "on_permanent_error": "continue"}` (below) so one bad video does not stop the rest.
 
@@ -104,34 +113,42 @@ One workflow can hold many videos. Send sources to `POST /api/workflows/{id}/sou
 | Preset | Pipeline | Extra cost |
 |---|---|---|
 | `fast` | source, canon, story, tts, audio | none |
-| `balanced` | ... story, **review**, tts, audio: an editor call checks canon, logic, style and length and records the verdict + issues; the story is not changed | one more model call per story |
-| `quality` | ... story, **review**, tts, audio: the editor also returns a **corrected story** (a new story version that TTS reads); up to 2 rounds (the corrected story is reviewed again) | up to 2 more calls, each with a full story in and out |
+| `balanced` | ... story, **review**, tts, audio: an editor call checks canon, logic, style and length and records the verdict + issues; the story is not changed; a failed review is skipped (advisory) | one more model call per story |
+| `quality` | ... story, **review**, tts, audio: the editor also returns a **corrected story** (a new story version that TTS reads); up to 2 rounds (the corrected story is reviewed again); a failed review blocks the project | up to 2 more calls, each with a full story in and out |
 
-An explicit `"review": {"enabled": true, "revise": false, "max_rounds": 1}` overrides the preset. The review is ONE call
-that covers all four aspects (parallel reviewer "teams" would need more than one model runner). A failed review is handled
-like any failed step (`failure_policy`). The verdict, the issues and the revision count are shown in the project detail
-(`review`, `revision_count` in the API).
+An explicit `"review": {...}` block is laid **over** the preset (`enabled`, `revise`, `max_rounds` 1..3, `on_failure`
+`"block"|"skip"`); `"review": null` is refused. The review is ONE call that covers all four aspects (parallel reviewer
+"teams" would need more than one model runner). A corrected story must be at least 95% of the story it corrects and at
+least 85% of the original target, must end like a finished text and must not contain the format marker, so repeated
+revisions cannot shrink or truncate the story. The verdict, the issues, the number of rounds and the revision count are
+shown in the project detail (`review`, `revision_count` in the API).
 
 ### Failure policy (subtitles and batches)
 
 `failure_policy` in the workflow config decides what happens when ONE video fails. New workflows get
 `{"subtitle_retries": 5, "retry_base_seconds": 30, "retry_max_seconds": 900, "on_no_subtitle": "pause",
-"on_permanent_error": "pause"}` unless you set your own.
+"on_permanent_error": "pause"}`; a policy you give is merged **over** these values (`{}` = the recommended policy; an
+explicit `null` switches that setting back to "unlimited / immediate").
 
 | Situation | What StoryFlow does |
 |---|---|
-| YouTube blocks / times out (`provider_blocked`, `provider_timeout`) | Retry after 30 s, 60 s, 120 s ... (capped at 15 min). The next-attempt time is stored, so a restart never hammers the provider. After `subtitle_retries` attempts the error becomes `subtitle_retries_exhausted`. |
-| No subtitle / wrong language / empty (`subtitles_unavailable`, `language_unavailable`, `empty_source`) | `on_no_subtitle: "pause"` (default) pauses the workflow; `"skip"` marks only that project **skipped** and the rest of the batch continues. |
-| Retries used up, source not configured | `on_permanent_error: "pause"` (default) pauses; `"continue"` marks only that project **needs_attention**. |
+| YouTube blocks / times out (`provider_blocked`, `provider_timeout`) | Retry after 30 s, 60 s, 120 s ... (capped at 15 min). The next-attempt time is stored, so a restart never hammers the provider. After `subtitle_retries` attempts the error becomes `subtitle_retries_exhausted`. An operator `retry` / `resume` starts again with fresh attempts. |
+| No subtitle, wrong language, empty, private / removed / age-restricted video (`subtitles_unavailable`, `language_unavailable`, `empty_source`) | `on_no_subtitle: "pause"` (default) pauses the workflow; `"skip"` marks only that project **skipped** and the rest of the batch continues. |
+| Anything else that goes wrong for one video (`subtitle_failed`), retries used up, source not configured | `on_permanent_error: "pause"` (default) pauses; `"continue"` marks only that project **needs_attention**. |
 | Provider not installed / misconfigured (`provider_unavailable`) | Always pauses (it would fail every video the same way). |
 
 Skipped / needs-attention projects are shown with their reason (UI: project card; API: `state`, `status_reason`,
 `status_detail.step`) and are counted in the workflow `counts`. A workflow finishes when every project is completed,
 skipped or needs-attention. Values are validated when the workflow is created (`422` with
-`reason: invalid_failure_policy`).
+`reason: invalid_failure_policy`); the `source`, `story` and `tts` blocks are type-checked too (`invalid_config`).
 
-With `on_permanent_error: "continue"` this also covers the AI / TTS steps: if `canon`, `story`, `tts` or `audio` fails
-for good (all retries used up) only that project becomes **needs_attention**; without it the whole workflow pauses.
+With `on_permanent_error: "continue"` this also covers the AI / TTS steps (including a step whose output failed
+validation when it was collected): if `canon`, `story`, `review`, `tts` or `audio` fails for good only that project
+becomes **needs_attention**; without it the whole workflow pauses. **Systemic problems always pause the workflow** even
+under `continue` (runner crashed / timed out, quota or login problem, no runner available, missing CLI or voice), and so
+does a **circuit breaker**: when 3 projects already ended with the same reason, the next one pauses the workflow instead
+(the cause is not the video). An unexpected internal error in one project is recorded as `internal_error` for that
+project and never stops the round for the others.
 
 **Bringing a project back:** `POST /api/projects/{project_id}/retry` (skipped or needs-attention only; anything else is a
 `409 not_retryable`). A failed AI / TTS step gets a fresh attempt, the subtitle step simply runs again, and a workflow
@@ -143,10 +160,23 @@ that had already finished is re-opened.
 N unfinished projects, in creation order (= newest video first), are advanced. When one completes, is skipped or needs
 attention, the next one starts immediately, so stages overlap (one story is being written while another is read aloud)
 while YouTube is not asked for every video at once. Channels are simply worked through in the order they were added.
+A finished project is recorded as `completed` (project `status`), so a batch of hundreds costs one row read per finished
+project instead of a walk through every step (60 projects: about 3x faster per runtime iteration than before).
 
 ### Story length
 
-Unless the workflow config sets `story.target_length` (words), the story is asked to be **at least as long as the source transcript** (whitespace-separated word count). A story shorter than 85% of the target is rejected and rewritten by the normal retry logic. Long stories take longer: `scripts\setup.bat` sets `STORYFLOW_STORY_TIMEOUT=1800`.
+Unless the workflow config sets `story.target_length` (an integer, words), the story is asked to be **at least as long as
+the source transcript** (whitespace-separated word count, capped at 15,000 words because one model call cannot write more).
+A story shorter than 85% of the target, one that repeats the same lines over and over, or one that contains an absolute
+file path is rejected and rewritten by the normal retry logic. Long stories take longer: `scripts\setup.bat` sets
+`STORYFLOW_STORY_TIMEOUT=1800`.
+
+### The final audio file
+
+Every completed project ends with ONE joined audio file, `audio\<generation>\run-001\final.wav` (the chunks in order with
+0.3 s between them, written as a stream so long stories do not need much memory). The API exposes it as
+`audio.final_path` and the project page has a "Full audio" player and a Download link. Audio files may be up to 4 GiB
+(text artifacts 256 MiB; raise with `STORYFLOW_AUDIO_MAX_MB` / `STORYFLOW_ARTIFACT_MAX_MB`).
 
 ## 4. Data layout
 

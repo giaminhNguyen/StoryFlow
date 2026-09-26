@@ -53,6 +53,7 @@ export interface ReviewInfo {
   id: string; round_number: number; status: string; verdict: ReviewVerdict | null; summary: string | null;
   issue_count: number; issues: ReviewIssue[]; revised: boolean; revised_version_id: string | null;
   error_code: string | null;
+  rounds?: number;   // how many review rounds the project has (this is the latest)
 }
 export interface BlockInfo { kind: BlockKind; message: string | null; until: string | null }
 export interface FailureInfo {

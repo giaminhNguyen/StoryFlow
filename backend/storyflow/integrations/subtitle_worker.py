@@ -31,6 +31,31 @@ def _fail(error: str, message: str) -> dict:
     return {"ok": False, "error": error, "message": _clean(message)}
 
 
+# Upstream exception classes are matched by NAME along the MRO (the worker never imports them eagerly).
+# ``blocked`` is checked first because IpBlocked derives from RequestBlocked.
+_BLOCKED_NAMES = frozenset({"RequestBlocked", "IpBlocked", "YouTubeRequestFailed", "PoTokenRequired",
+                            "TooManyRequests"})
+_LANGUAGE_NAMES = frozenset({"NotTranslatable", "TranslationLanguageNotAvailable"})
+_VIDEO_NAMES = frozenset({"VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId",
+                          "TranscriptsDisabled", "NoTranscriptFound", "NoTranscriptAvailable"})
+
+
+def _upstream_error_kind(exc) -> str:
+    """Error code for an exception raised by the upstream provider for ONE video.
+
+    blocked / language_unavailable / video_unavailable for the known classes, ``subtitle_failed`` (a per-item,
+    permanent error) for anything unexpected. Worker-level problems keep their own codes (import_error, internal).
+    """
+    names = {c.__name__ for c in type(exc).__mro__}
+    if names & _BLOCKED_NAMES:
+        return "blocked"
+    if names & _LANGUAGE_NAMES:
+        return "language_unavailable"
+    if names & _VIDEO_NAMES:
+        return "video_unavailable"
+    return "subtitle_failed"
+
+
 def _version(name: str):
     from importlib import metadata
     try:
@@ -86,8 +111,8 @@ def handle(op: str, req: dict) -> dict:
         return _fail("no_subtitle", str(exc) or "no subtitle")
     except OSError as exc:  # requests/urllib3 connection + timeout errors derive from OSError: transient
         return _fail("network", f"{type(exc).__name__}: {exc}")
-    except Exception as exc:  # noqa: BLE001 - worker boundary: classify anything else as "internal"
-        return _fail("internal", f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - worker boundary: an odd video must not look like a broken install
+        return _fail(_upstream_error_kind(exc), f"{type(exc).__name__}: {exc}")
 
 
 def main(argv) -> int:
