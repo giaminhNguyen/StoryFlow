@@ -43,11 +43,11 @@ export function StateBadge({ state }: { state: DisplayState }) {
 
 export const PROJECT_STATE_LABELS: Record<ProjectState, string> = {
   completed: "Completed", failed: "Failed", blocked: "Blocked", waiting_capacity: "Waiting for capacity",
-  in_progress: "In progress", not_started: "Not started",
+  in_progress: "In progress", not_started: "Not started", skipped: "Skipped", needs_attention: "Needs attention",
 };
 const PROJECT_ICONS: Record<ProjectState, string> = {
   completed: "✔", failed: "✖", blocked: "⛔", waiting_capacity: "⏳", in_progress: "▶",
-  not_started: "○",
+  not_started: "○", skipped: "⤼", needs_attention: "⚠",
 };
 
 export function ProjectStateBadge({ state }: { state: ProjectState }) {

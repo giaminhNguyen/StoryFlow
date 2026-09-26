@@ -67,6 +67,23 @@ Provider states: `ready`, `unavailable` (a dependency is missing; the message sa
 
 Other variables: `STORYFLOW_LOG_LEVEL` (default `info`), `STORYFLOW_LOG_DIR`.
 
+### Failure policy (subtitles and batches)
+
+`failure_policy` in the workflow config decides what happens when ONE video fails. New workflows get
+`{"subtitle_retries": 5, "retry_base_seconds": 30, "retry_max_seconds": 900, "on_no_subtitle": "pause",
+"on_permanent_error": "pause"}` unless you set your own.
+
+| Situation | What StoryFlow does |
+|---|---|
+| YouTube blocks / times out (`provider_blocked`, `provider_timeout`) | Retry after 30 s, 60 s, 120 s ... (capped at 15 min). The next-attempt time is stored, so a restart never hammers the provider. After `subtitle_retries` attempts the error becomes `subtitle_retries_exhausted`. |
+| No subtitle / wrong language / empty (`subtitles_unavailable`, `language_unavailable`, `empty_source`) | `on_no_subtitle: "pause"` (default) pauses the workflow; `"skip"` marks only that project **skipped** and the rest of the batch continues. |
+| Retries used up, source not configured | `on_permanent_error: "pause"` (default) pauses; `"continue"` marks only that project **needs_attention**. |
+| Provider not installed / misconfigured (`provider_unavailable`) | Always pauses (it would fail every video the same way). |
+
+Skipped / needs-attention projects are shown with their reason (UI: project card; API: `state`, `status_reason`) and are
+counted in the workflow `counts`. A workflow finishes when every project is completed, skipped or needs-attention.
+Values are validated when the workflow is created (`422` with `reason: invalid_failure_policy`).
+
 ### Story length
 
 Unless the workflow config sets `story.target_length` (words), the story is asked to be **at least as long as the source transcript** (whitespace-separated word count). A story shorter than 85% of the target is rejected and rewritten by the normal retry logic. Long stories take longer: `scripts\setup.bat` sets `STORYFLOW_STORY_TIMEOUT=1800`.

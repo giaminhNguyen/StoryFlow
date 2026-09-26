@@ -34,6 +34,7 @@ from .models import (
     PauseReason,
     PipelineJob,
     StoryProject,
+    TERMINAL_PROJECT_STATUSES,
     WorkflowSession,
 )
 from .pipeline import InlineStepHandler, PipelineContext, StepHandler, StepStatus
@@ -43,8 +44,9 @@ logger = logging.getLogger(__name__)
 _FRESH = {"execution_options": {"populate_existing": True}}
 _MAX_STEP_PASSES = 4  # begin -> link -> finalize -> re-status; bounded so a buggy handler can't spin
 
-# Step outcomes (internal)
-_DONE, _WAIT, _FAILED, _AGAIN = "done", "wait", "failed", "again"
+# Step outcomes (internal). _ENDED: the project reached a terminal batch outcome (skipped /
+# needs_attention) under the workflow's failure policy; it is not a workflow failure.
+_DONE, _WAIT, _FAILED, _AGAIN, _ENDED = "done", "wait", "failed", "again", "ended"
 
 
 @dataclass
@@ -56,6 +58,7 @@ class ProjectState:
     domain_id: str | None = None
     job_id: str | None = None
     error_code: str | None = None
+    terminal: str | None = None    # "skipped" | "needs_attention": the project is done for this batch
 
 
 @dataclass
@@ -66,6 +69,7 @@ class TickResult:
     finalized: list[tuple[str, str]] = field(default_factory=list)   # (project_id, step)
     failed: list[tuple[str, str, str | None]] = field(default_factory=list)  # (project_id, step, error)
     ran_inline: list[tuple[str, str]] = field(default_factory=list)
+    ended: list[tuple[str, str, str | None]] = field(default_factory=list)   # (project_id, step, error_code)
     recovered: int = 0
 
     @property
@@ -208,6 +212,11 @@ class Orchestrator:
                 if out.status is StepStatus.COMPLETED:
                     return _DONE
                 if out.status is StepStatus.FAILED:
+                    if self._is_terminal(db, project_id):  # policy: skip / continue, never pause the batch
+                        logger.info("project_ended project=%s step=%s error_code=%s", project_id, handler.step,
+                                    str(out.error_code)[:80])
+                        res.ended.append((project_id, handler.step, out.error_code))
+                        return _ENDED
                     res.failed.append((project_id, handler.step, out.error_code))
                     return _FAILED
                 return _WAIT
@@ -243,7 +252,15 @@ class Orchestrator:
             return _FAILED
         return _WAIT  # queued / processing / waiting_capacity
 
+    @staticmethod
+    def _is_terminal(db, project_id: str) -> bool:
+        db.expire_all()
+        project = db.get(StoryProject, project_id)
+        return project is not None and project.status in TERMINAL_PROJECT_STATUSES
+
     def _advance_project(self, db, project_id: str, wf: ChannelWorkflow, now, res: TickResult) -> None:
+        if self._is_terminal(db, project_id):
+            return  # skipped / needs_attention: nothing more to do for this project
         for handler in self.chain:
             outcome = _AGAIN
             for _ in range(_MAX_STEP_PASSES):
@@ -255,6 +272,10 @@ class Orchestrator:
             return  # waiting, failed, or (bounded) unresolved: nothing later may advance
 
     def _position(self, db, project_id: str) -> ProjectState:
+        db.expire_all()
+        project = db.get(StoryProject, project_id)
+        if project is not None and project.status in TERMINAL_PROJECT_STATUSES:
+            return ProjectState(None, None, error_code=project.status_reason, terminal=project.status)
         for handler in self.chain:
             db.expire_all()
             view = handler.status(db, self.ctx, db.get(StoryProject, project_id))

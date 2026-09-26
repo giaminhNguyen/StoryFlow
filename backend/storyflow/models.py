@@ -216,6 +216,18 @@ class VersionStatus(str, enum.Enum):
     ABANDONED = "abandoned"
 
 
+class ProjectStatus(str, enum.Enum):
+    """StoryProject.status. ``skipped`` / ``needs_attention`` are terminal for the batch: the orchestrator
+    stops advancing the project but the workflow carries on (see storyflow/policy.py)."""
+
+    ACTIVE = "active"
+    SKIPPED = "skipped"                  # e.g. the video has no usable subtitle
+    NEEDS_ATTENTION = "needs_attention"  # failed for good; an operator must look at it
+
+
+TERMINAL_PROJECT_STATUSES = (ProjectStatus.SKIPPED.value, ProjectStatus.NEEDS_ATTENTION.value)
+
+
 # Partial unique dedupe targets, shared by the model indexes and the migration
 # (same pattern as ACTIVE_DEDUPE_WHERE on pipeline_jobs).
 SNAPSHOT_ACTIVE_WHERE = "status = 'active'"
@@ -265,6 +277,11 @@ class StoryProject(Base):
     slug: Mapped[str | None] = mapped_column(String(128), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default=VersionStatus.ACTIVE.value)
+    # Phase 4.2 (0006): source-step retry/backoff state + why a project ended as skipped/needs_attention.
+    source_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

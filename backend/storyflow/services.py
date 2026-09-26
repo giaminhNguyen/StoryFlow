@@ -52,6 +52,7 @@ from .models import (
 )
 from .orchestrator import Orchestrator
 from .pipeline import PipelineContext
+from .policy import RECOMMENDED, PolicyError, parse_failure_policy
 from .roles import Role
 
 _FRESH = {"execution_options": {"populate_existing": True}}
@@ -203,6 +204,12 @@ class WorkflowService:
         if all_agents_unavailable_policy not in _VALID_POLICIES:
             raise ValidationFailed("invalid all_agents_unavailable_policy", reason="invalid_policy",
                                    allowed=list(_VALID_POLICIES))
+        try:
+            parse_failure_policy(config.get("failure_policy"))
+        except PolicyError as exc:
+            raise ValidationFailed(str(exc), reason="invalid_failure_policy") from None
+        if "failure_policy" not in config:  # record the policy that applies (retry with backoff, then pause)
+            config = {**config, "failure_policy": dict(RECOMMENDED)}
         role_preferences = self._validate_role_preferences(role_preferences)
         if client_key is not None and (not isinstance(client_key, str) or not client_key.strip()
                                        or len(client_key) > 128):

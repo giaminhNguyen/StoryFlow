@@ -7,7 +7,9 @@ export type DisplayState =
 export type WorkflowStatus = "draft" | "active" | "paused" | "finished" | "cancelled" | "abandoned";
 export type StepName = "source" | "canon" | "story" | "tts" | "audio";
 export type StepStatus = "not_started" | "in_progress" | "completed" | "failed";
-export type ProjectState = "completed" | "failed" | "blocked" | "waiting_capacity" | "in_progress" | "not_started";
+export type ProjectState =
+  | "completed" | "failed" | "blocked" | "waiting_capacity" | "in_progress" | "not_started"
+  | "skipped" | "needs_attention";
 export type FailureCategory = "business" | "infrastructure" | "capacity" | "provider" | "unknown";
 export type BlockKind = "waiting_capacity" | "chunks_missing" | "provider_blocked" | "delayed" | "inconsistent";
 
@@ -55,6 +57,9 @@ export interface ProjectSnapshot {
   source: SourceInfo | null; canon: CanonInfo | null; story_generation: StoryGenerationInfo | null;
   story_version: StoryVersionInfo | null; tts: TtsInfo | null; audio: AudioInfo | null;
   block: BlockInfo | null; failure: FailureInfo | null;
+  // batch outcome (failure policy) and source retry state; absent on older backends
+  status_reason?: string | null; status_detail?: Record<string, unknown> | null;
+  source_attempts?: number; next_attempt_at?: string | null;
 }
 
 export interface RunnerSnapshot {
@@ -72,6 +77,7 @@ export interface CapacitySummary {
 }
 export interface WorkflowCounts {
   completed: number; failed: number; blocked: number; in_progress: number; waiting_capacity: number; not_started: number;
+  skipped: number; needs_attention: number;
 }
 export interface WorkflowSummary {
   id: string; name: string; mode: string; status: WorkflowStatus; status_reason: string | null;

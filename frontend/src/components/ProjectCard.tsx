@@ -24,6 +24,19 @@ export function failureText(f: FailureInfo): string {
   }
 }
 
+const OUTCOME_REASONS: Record<string, string> = {
+  subtitles_unavailable: "The video has no usable subtitles",
+  language_unavailable: "No subtitle in the requested language",
+  empty_source: "The subtitle was empty",
+  subtitle_retries_exhausted: "The subtitle provider kept failing; retries used up",
+  source_not_configured: "No source video is configured for this project",
+};
+
+export function outcomeText(p: ProjectSnapshot): string {
+  const code = p.status_reason ?? "unknown";
+  return `${OUTCOME_REASONS[code] ?? code} (${code}). The rest of the batch continues.`;
+}
+
 export function blockText(b: BlockInfo): string {
   switch (b.kind) {
     case "waiting_capacity": return "Waiting for capacity: no eligible runner yet";
@@ -50,6 +63,12 @@ export function ProjectCard({ project, capacity }: { project: ProjectSnapshot; c
         {project.current_step ? `Current step: ${project.current_step}` : "No active step"}
       </p>
       <PipelineSteps steps={project.steps} />
+      {(project.state === "skipped" || project.state === "needs_attention") && (
+        <div className="problem problem-block" role="group" aria-label="Outcome">
+          <strong>{project.state === "skipped" ? "Skipped" : "Needs attention"}</strong>
+          <p>{outcomeText(project)}</p>
+        </div>
+      )}
       {failure && (
         <div className={`problem problem-${failure.category}`} role="group" aria-label="Failure">
           <strong>Failure ({failure.category})</strong>

@@ -70,7 +70,7 @@ export function makeWorkflow(over: Partial<WorkflowSnapshot> = {}): WorkflowSnap
   void _unused;
   return {
     ...summary, status_detail: null,
-    counts: { completed: 0, failed: 0, blocked: 0, in_progress: 1, waiting_capacity: 0, not_started: 0 },
+    counts: { completed: 0, failed: 0, blocked: 0, in_progress: 1, waiting_capacity: 0, not_started: 0, skipped: 0, needs_attention: 0 },
     projects: [makeProject()], runners: [],
     capacity: { registered: 0, ready: 0, busy: 0, offline: 0, quota: 0, cooldown: 0, roles: [], unserved_roles: [],
       message: null },
@@ -80,7 +80,7 @@ export function makeWorkflow(over: Partial<WorkflowSnapshot> = {}): WorkflowSnap
 
 export function makeHealth(over: Partial<Health> = {}): Health {
   return {
-    status: "ok", db: { ok: true, schema_revision: "0005_control_plane", at_head: true },
+    status: "ok", db: { ok: true, schema_revision: "0006_source_policy", at_head: true },
     runtime: { mode: "embedded", running: true, iteration: 1, errors: 0 },
     runners: { registered: 1, assigned: 0, ready: 1, offline: 0 }, demo: { video_id: "demo-video" },
     version: "0.6.0", ...over,

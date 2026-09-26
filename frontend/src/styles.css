@@ -23,6 +23,8 @@ a { color: var(--info); }
 .badge-failed, .badge-p-failed { color: var(--bad); font-weight: 700; }
 .badge-blocked, .badge-p-blocked { color: var(--bad); border-style: dashed; border-width: 2px; }
 .badge-cancelled { color: var(--muted); text-decoration: line-through; }
+.badge-p-skipped { color: var(--muted); border-style: dotted; }
+.badge-p-needs_attention { color: var(--warn); font-weight: 700; border-width: 2px; }
 .badge-completed, .badge-p-completed { color: var(--ok); font-weight: 600; }
 .chip-ok { color: var(--ok); } .chip-warn { color: var(--warn); } .chip-bad { color: var(--bad); }
 .banner { padding: 8px 12px; margin: 8px 0; border-radius: 4px; border: 1px solid; }

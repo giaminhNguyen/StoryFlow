@@ -82,7 +82,18 @@ Current migration head:
 → 0003_story_domain
 → 0004_pipeline_dedupe
 → 0005_control_plane
+→ 0006_source_policy
 ```
+
+### Post-MVP roadmap progress (batch operation)
+
+| Step | Status |
+|---|---|
+| P0 story length >= source, single `final.wav`, one-click setup | done |
+| P1 failure policy: subtitle backoff/retry limit, `skipped` / `needs_attention` projects, batch keeps going (migration `0006`) | done - see `docs/OPERATIONS.md` "Failure policy" |
+| P2 channel / playlist / video-list input, processed-video ledger | planned |
+| P3 batch orchestration (bounded overlap, retry a skipped project) | planned |
+| P4 review + revision, presets (Fast / Balanced / Quality) | planned |
 
 Phase 9 validation: backend `684 passed, 6 skipped` on three independent runs (Phase 8: 541, Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 

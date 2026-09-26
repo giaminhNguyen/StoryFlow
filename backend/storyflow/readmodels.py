@@ -20,7 +20,8 @@ Failure category mapping (``categorize_error``; case-insensitive)
   infrastructure  INFRA_EXHAUSTED, LEASE_EXPIRED, runner_crashed, timeout, transient_failure,
                   rate_limited, quota_exhausted, auth_error
   capacity        ALL_AGENTS_UNAVAILABLE / all_agents_unavailable
-  provider        provider_blocked, subtitles_unavailable, language_unavailable
+  provider        provider_blocked, provider_timeout, provider_unavailable, subtitles_unavailable,
+                  language_unavailable, subtitle_retries_exhausted
   unknown         anything else (including a missing code)
 
 display_state (workflow)
@@ -61,6 +62,7 @@ from .models import (
     DomainStatus,
     JobStatus,
     PauseReason,
+    ProjectStatus,
     PipelineJob,
     RunnerInstance,
     RunnerState,
@@ -89,7 +91,8 @@ _CATEGORY_CODES = {
     INFRASTRUCTURE: {"infra_exhausted", "lease_expired", "runner_crashed", "timeout",
                      "transient_failure", "rate_limited", "quota_exhausted", "auth_error"},
     CAPACITY: {"all_agents_unavailable"},
-    PROVIDER: {"provider_blocked", "subtitles_unavailable", "language_unavailable"},
+    PROVIDER: {"provider_blocked", "provider_timeout", "provider_unavailable", "subtitles_unavailable",
+                "language_unavailable", "subtitle_retries_exhausted"},
 }
 _CODE_TO_CATEGORY = {code: cat for cat, codes in _CATEGORY_CODES.items() for code in codes}
 
@@ -302,7 +305,7 @@ class ProjectSnapshot:
     title: str
     slug: str | None
     status: str
-    state: str            # completed|failed|blocked|waiting_capacity|in_progress|not_started
+    state: str            # completed|failed|blocked|waiting_capacity|in_progress|not_started|skipped|needs_attention
     current_step: str | None
     step_status: str | None
     steps: list = field(default_factory=list)   # list[StepSummary]
@@ -314,6 +317,11 @@ class ProjectSnapshot:
     audio: AudioInfo | None = None
     block: BlockInfo | None = None
     failure: FailureInfo | None = None
+    # Batch outcome (failure policy): why the project is skipped / needs_attention, and source retry state.
+    status_reason: str | None = None
+    status_detail: dict | None = None
+    source_attempts: int = 0
+    next_attempt_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +332,8 @@ class WorkflowCounts:
     in_progress: int = 0
     waiting_capacity: int = 0
     not_started: int = 0
+    skipped: int = 0
+    needs_attention: int = 0
 
 
 @dataclass(frozen=True)
@@ -595,7 +605,8 @@ class ReadModels:
             display = _display_from(wf.status, wf.status_reason,
                                     [(s.state, s.block.kind if s.block else None) for s in snaps])
             tally = {k: sum(1 for s in snaps if s.state == k) for k in
-                     ("completed", "failed", "blocked", "in_progress", "waiting_capacity", "not_started")}
+                     ("completed", "failed", "blocked", "in_progress", "waiting_capacity", "not_started",
+                      "skipped", "needs_attention")}
             return WorkflowSnapshot(
                 id=wf.id, name=wf.name, mode=wf.mode, status=wf.status, status_reason=wf.status_reason,
                 status_detail=dict(wf.status_detail) if wf.status_detail else None,
@@ -735,12 +746,16 @@ class ReadModels:
                             audio_row, registered, tts_info, now)
         failure = self._failure(wf, project, current, cur_view, jobs.get(current) if current else None)
         state = self._state(current, cur_view, block, failure)
+        if project.status in (ProjectStatus.SKIPPED.value, ProjectStatus.NEEDS_ATTENTION.value):
+            state, block, failure = project.status, None, None  # terminal batch outcome wins over step views
         return ProjectSnapshot(
             id=project.id, workflow_id=project.channel_workflow_id, title=project.title, slug=project.slug,
             status=project.status, state=state, current_step=current,
             step_status=cur_view.status.value if cur_view else None, steps=steps, source=source,
             canon=canon, story_generation=gen, story_version=story_version, tts=tts_info, audio=audio_info,
-            block=block, failure=failure)
+            block=block, failure=failure, status_reason=project.status_reason,
+            status_detail=dict(project.status_detail) if project.status_detail else None,
+            source_attempts=project.source_attempts or 0, next_attempt_at=project.next_attempt_at)
 
     @staticmethod
     def _state(current, cur_view, block, failure) -> str:
@@ -772,6 +787,9 @@ class ReadModels:
                                  or f"{registered} of {expected} audio chunks registered")
         if current is None:
             return None
+        if current == "source" and project.next_attempt_at is not None and project.next_attempt_at > now:
+            return BlockInfo(BLOCK_DELAYED, "subtitle retry scheduled after a provider error",
+                             until=project.next_attempt_at)
         if wf is not None and wf.status == ChannelWorkflowStatus.PAUSED.value and \
                 wf.status_reason == PauseReason.STEP_FAILED.value:
             detail = wf.status_detail or {}

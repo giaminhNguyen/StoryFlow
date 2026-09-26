@@ -15,6 +15,7 @@ from storyflow import queue
 from storyflow.agents import FakeRunner, RunnerRegistry
 from storyflow.dispatcher import Dispatcher, DispatchOutcome
 from storyflow.errors import Conflict, InvalidState, NotFound, NotRetryable, StoryFlowError, ValidationFailed
+from storyflow.policy import RECOMMENDED
 from storyflow.models import (
     AudioGeneration, CanonAnalysis, ChannelWorkflow, ChannelWorkflowStatus, JobStatus, PipelineJob,
     RunnerInstance, StoryGeneration, StoryProject, StoryVersion, TTSGeneration, WorkflowSession,
@@ -79,7 +80,8 @@ def test_create_makes_draft_with_one_session(env):
     r = svc(env).create_workflow("  My channel ", config={"a": 1}, role_preferences={"story_writer": ["x"]})
     assert r.changed and r.status == "draft"
     wf = wf_row(env, r.workflow_id)
-    assert wf.name == "My channel" and wf.workflow_session_id and wf.config == {"a": 1}
+    assert wf.name == "My channel" and wf.workflow_session_id
+    assert wf.config == {"a": 1, "failure_policy": RECOMMENDED}  # the applied failure policy is recorded
     assert env.count(WorkflowSession) == before + 1
     sess = env.q(lambda db: db.get(WorkflowSession, wf.workflow_session_id))
     assert sess.role_preferences == {"story_writer": ["x"]}

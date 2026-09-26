@@ -66,6 +66,7 @@ export function WorkflowDetailPage({ workflowId, client }: { workflowId: string;
       <p className="counts" aria-label="Project counts">
         {wf.projects.length} projects: {c.completed} completed, {c.in_progress} in progress, {c.waiting_capacity} waiting,{" "}
         {c.blocked} blocked, {c.failed} failed, {c.not_started} not started
+        {c.skipped + c.needs_attention > 0 && `, ${c.skipped} skipped, ${c.needs_attention} need attention`}
       </p>
       <ControlBar client={client} workflow={wf} onDone={refreshAll} />
       <h2>Projects</h2>

@@ -46,6 +46,7 @@ callers, and no absolute path in any persisted row.
 import hashlib
 import json
 import re
+from datetime import timedelta
 from pathlib import PurePosixPath
 
 from sqlalchemy import func, select, update
@@ -61,6 +62,7 @@ from .models import (
     StoryGeneration,
     StoryProject,
     StoryVersion,
+    TERMINAL_PROJECT_STATUSES,
     VersionStatus,
 )
 from .pipeline import (
@@ -72,6 +74,7 @@ from .pipeline import (
     StepView,
     workflow_config,
 )
+from .policy import FailurePolicy, classify_source_error, policy_from_config, terminal_status_for
 from .protocol import ResultCode, RunnerResult, TaskPacket
 from .roles import Role
 from .subtitles import (
@@ -247,11 +250,19 @@ class SourceStep(InlineStepHandler):
       SubtitlesUnavailable -> FAILED   error_code "subtitles_unavailable" (permanent)
       LanguageUnavailable  -> FAILED   error_code "language_unavailable"  (permanent for this config)
       BlockedByProvider    -> NOT_STARTED error_code "provider_blocked"   (transient: nothing
-                              was persisted, so no domain row exists; the next tick retries.
+                              was persisted, so no domain row exists; retried after a backoff.
                               Not FAILED, because a block is not a business failure.)
       ProviderTimeout      -> NOT_STARTED error_code "provider_timeout"   (transient, like a block)
       ProviderUnavailable  -> FAILED   error_code "provider_unavailable"  (operator must fix
                               the provider install/config; resume/retry re-runs the step)
+
+    Batch failure policy (``failure_policy`` in the workflow config, see ``storyflow.policy``):
+      * transient errors are retried after ``retry_base_seconds * 2**(n-1)`` (capped); the next
+        attempt time is durable (``story_projects.next_attempt_at``) so a restart never hammers the
+        provider. After ``subtitle_retries`` attempts the error becomes ``subtitle_retries_exhausted``.
+      * ``on_no_subtitle=skip`` marks just this project ``skipped``; ``on_permanent_error=continue``
+        marks it ``needs_attention``. The step still returns FAILED; the orchestrator sees the terminal
+        project status and does NOT pause the workflow. With ``pause`` (default) nothing changes.
     Snapshots are immutable: an existing active snapshot is returned as-is, never replaced.
     """
 
@@ -271,29 +282,37 @@ class SourceStep(InlineStepHandler):
             existing = _active_snapshot(db, project_id)
             if existing is not None:
                 return StepView(StepStatus.COMPLETED, domain_id=existing.id)
-            cfg = dict(workflow_config(db, project).get("source") or {})
+            wf_config = workflow_config(db, project)
+            cfg = dict(wf_config.get("source") or {})
+            policy = policy_from_config(wf_config)
             title = project.title
+            if project.status in TERMINAL_PROJECT_STATUSES:  # already skipped / needs attention
+                return StepView(StepStatus.FAILED, error_code=project.status_reason or project.status)
+            retry_at = project.next_attempt_at
+            if retry_at is not None and ctx.clock() < retry_at:  # backing off: do not touch the provider
+                last = (project.status_detail or {}).get("last_error") or "provider_blocked"
+                return StepView(StepStatus.NOT_STARTED, error_code=last)
         video_id = cfg.get("video_id")
         if not video_id:
-            return StepView(StepStatus.FAILED, error_code="source_not_configured")
+            return self._failed(ctx, project_id, "source_not_configured", policy)
 
         try:  # no DB transaction is open here
             fetched = ctx.subtitle_client.fetch(
                 video_id, cfg.get("languages"), cfg.get("preference", "any"),
                 cfg.get("allow_translation", True))
         except SubtitlesUnavailable:
-            return StepView(StepStatus.FAILED, error_code="subtitles_unavailable")
+            return self._failed(ctx, project_id, "subtitles_unavailable", policy)
         except LanguageUnavailable:
-            return StepView(StepStatus.FAILED, error_code="language_unavailable")
+            return self._failed(ctx, project_id, "language_unavailable", policy)
         except (BlockedByProvider, ProviderTimeout) as exc:
             code = "provider_timeout" if isinstance(exc, ProviderTimeout) else "provider_blocked"
-            return StepView(StepStatus.NOT_STARTED, error_code=code)
+            return self._transient(ctx, project_id, code, policy)
         except ProviderUnavailable:
-            return StepView(StepStatus.FAILED, error_code="provider_unavailable")
+            return StepView(StepStatus.FAILED, error_code="provider_unavailable")  # operator: always pause
 
         content = plain_text(fetched)
         if not content.strip():
-            return StepView(StepStatus.FAILED, error_code="empty_source")
+            return self._failed(ctx, project_id, "empty_source", policy)
         data = content.encode("utf-8")
         content_hash = hashlib.sha256(data).hexdigest()
 
@@ -319,8 +338,69 @@ class SourceStep(InlineStepHandler):
             }
             snap = self._insert_snapshot(ctx, project_id, number, title, content, content_hash, meta)
             if snap is not None:
+                self._clear_backoff(ctx, project_id)
                 return StepView(StepStatus.COMPLETED, domain_id=snap)
         return StepView(StepStatus.IN_PROGRESS, error_code="snapshot_contention")
+
+    # -- failure policy ----------------------------------------------------------------
+
+    @staticmethod
+    def _failed(ctx: PipelineContext, project_id: str, code: str, policy: FailurePolicy) -> StepView:
+        """A non-transient source failure: under skip / continue only this project ends
+        (skipped / needs_attention); otherwise the caller pauses the workflow as before."""
+        terminal = terminal_status_for(policy, classify_source_error(code))
+        if terminal is not None:
+            SourceStep._end_project(ctx, project_id, terminal, code)
+        return StepView(StepStatus.FAILED, error_code=code)
+
+    @staticmethod
+    def _transient(ctx: PipelineContext, project_id: str, code: str, policy: FailurePolicy) -> StepView:
+        """A block / timeout: schedule the next attempt with exponential backoff, or give up."""
+        exhausted = False
+        with ctx.session_factory() as db:
+            project = _get(db, StoryProject, project_id)
+            attempts = (project.source_attempts or 0) + 1
+            project.source_attempts = attempts
+            now = ctx.clock()
+            if policy.exhausted(attempts):
+                exhausted = True
+                project.next_attempt_at = None
+                project.status_detail = {"step": "source", "last_error": code, "attempts": attempts}
+            else:
+                delay = policy.backoff_seconds(attempts)
+                project.next_attempt_at = now + timedelta(seconds=delay) if delay > 0 else None
+                project.status_detail = {"step": "source", "last_error": code, "attempts": attempts,
+                                         "retry_in_seconds": delay}
+            project.updated_at = now
+            db.commit()
+        if not exhausted:
+            return StepView(StepStatus.NOT_STARTED, error_code=code)
+        return SourceStep._failed(ctx, project_id, "subtitle_retries_exhausted", policy)
+
+    @staticmethod
+    def _end_project(ctx: PipelineContext, project_id: str, status: str, code: str) -> None:
+        with ctx.session_factory() as db:
+            project = _get(db, StoryProject, project_id)
+            if project is None or project.status in TERMINAL_PROJECT_STATUSES:
+                return
+            project.status = status
+            project.status_reason = code
+            project.next_attempt_at = None
+            detail = dict(project.status_detail or {})
+            detail.update({"step": "source", "error_code": code})
+            project.status_detail = detail
+            project.updated_at = ctx.clock()
+            db.commit()
+
+    @staticmethod
+    def _clear_backoff(ctx: PipelineContext, project_id: str) -> None:
+        with ctx.session_factory() as db:
+            project = _get(db, StoryProject, project_id)
+            if project is not None and (project.source_attempts or project.next_attempt_at):
+                project.source_attempts = 0
+                project.next_attempt_at = None
+                project.status_detail = None
+                db.commit()
 
     @staticmethod
     def _insert_snapshot(ctx, project_id, number, title, content, content_hash, meta) -> str | None:
