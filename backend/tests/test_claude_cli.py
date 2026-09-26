@@ -105,7 +105,7 @@ def test_story_success_and_prompt_content(store, tmp_path, monkeypatch):
     text = store.read(packet.outputs[0]).decode()
     assert text.startswith("# The Other Door") and text.endswith("\n")
     stdin = record(tmp_path)["stdin"]
-    assert "the door stays shut" in stdin and "about 120 words" in stdin and "Direction: dark" in stdin
+    assert "the door stays shut" in stdin and "AT LEAST 120 words" in stdin and "Direction: dark" in stdin
     assert "story-branch-writer" in stdin and "central_conflict" in stdin
 
 

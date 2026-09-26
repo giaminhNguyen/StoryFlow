@@ -6,6 +6,7 @@ FAKE_CLAUDE_RECORD; FAKE_CLAUDE_PIDFILE receives this pid (and a grandchild pid 
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,8 +50,12 @@ def main():
                 f.write(f"{os.getpid()} {child.pid}")
         time.sleep(120)
         return 0
+    story = STORY
+    wanted = re.search(r"AT LEAST (\d+) words", stdin)  # honour the length asked for in the prompt
+    while wanted and len(story.split()) < int(wanted.group(1)):
+        story += STORY
     if mode == "success":
-        out.write(envelope(json.dumps(CANON) if is_canon else STORY))
+        out.write(envelope(json.dumps(CANON) if is_canon else story))
     elif mode == "fenced":
         out.write(envelope("Here you go:\n```json\n" + json.dumps(CANON) + "\n```" if is_canon
                            else "```markdown\n" + STORY + "\n```"))

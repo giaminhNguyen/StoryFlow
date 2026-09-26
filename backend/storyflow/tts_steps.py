@@ -521,7 +521,8 @@ def assemble_final_audio(store: ArtifactStore, store_dir: str, total: int) -> st
         if params is None:
             return None
         channels, width, rate, _ = params
-        silence = bytes(1) * (int(rate * CHUNK_GAP_SECONDS) * channels * width)
+        # unsigned 8-bit PCM is centred on 0x80; 16-bit PCM on 0x00
+        silence = bytes([0x80 if width == 1 else 0]) * (int(rate * CHUNK_GAP_SECONDS) * channels * width)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as out:
             out.setnchannels(channels)

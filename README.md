@@ -11,7 +11,8 @@ analyses its canon, writes a story with a local model runner and synthesises nar
 Requirements: Python 3.11+ (tested 3.13), Node.js 20+ (tested 24), Git. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ```bat
-scripts\setup.bat        REM once (idempotent): pinned sources, backend\.venv, npm ci + build, health check
+setup.bat                REM ONE CLICK after cloning (idempotent): pinned sources, backend\.venv, npm ci + build, then asks a
+                         REM few questions (subtitles / Claude / VieNeu voice...), writes backend\.env, health check
 start-app.bat            REM API + runtime + UI on http://127.0.0.1:8765 (opens the browser)
 start-app.bat --fake     REM deterministic offline demo (no model, no network)
                          REM stop with Ctrl+C
@@ -42,6 +43,21 @@ Real providers are opt-in (`backend\.env`, see `backend\.env.example`); fakes ar
 | Subtitles | external (pinned Subtitle_supperVip subprocess) | `STORYFLOW_SUBTITLE_PROVIDER=external` | `pip install -r backend\requirements-subtitle.txt` |
 | Story / canon | none | `STORYFLOW_STORY_RUNNER=claude-cli` | `claude` CLI installed and logged in |
 | TTS | none | `STORYFLOW_TTS_ENGINE=vieneu`, `STORYFLOW_VIENEU_ROOT` | local VieNeu-TTS checkout |
+
+`setup.bat` detects `claude` and VieNeu-TTS, lists the available voices and writes `backend\.env` for you
+(`scripts\configure_providers.py`; re-run it any time, the old file is kept as `.env.bak`). Everything generated on a machine
+(`runtime\`, `.env`, audio, logs, venv, `external\`, `skills\`) is git-ignored.
+
+### What a run produces
+
+For every video, under `runtime\artifacts\projects\<project-id>\`:
+
+| Artifact | Path |
+|---|---|
+| Source transcript | `source\0001\source.txt` |
+| New story | `story\<generation>\story.md` - **at least as long as the source** (default `story.target_length` = source word count; a story under 85% of the target is rejected and rewritten) |
+| TTS text + chunks | `tts\<generation>\` |
+| Audio chunks and **one final file** | `audio\<generation>\run-001\0001.wav ...` and `final.wav` (chunks joined, 0.3 s pause between) |
 
 Security: loopback-only, **no authentication** (never expose the port); secrets are never stored or logged.
 Everything below is the per-phase engineering history and reference.

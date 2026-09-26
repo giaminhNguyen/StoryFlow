@@ -731,6 +731,13 @@ class FakeStoryPipelineRunner(AgentRunner):
             f"{canon['central_conflict']}. Every choice now carries a consequence, "
             "and the rival answers each move. In the end the truth comes out.\n"
         )
+        target = (packet.inputs or {}).get("target_length")
+        if isinstance(target, int) and not isinstance(target, bool) and target > 0:
+            # honour the length contract like a real writer would: keep developing scenes
+            n = 0
+            while len(text.split()) < target:
+                n += 1
+                text += f"\nScene {n}: {name} weighs another consequence while the rival answers in kind.\n"
         return text.encode("utf-8")
 
 
