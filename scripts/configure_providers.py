@@ -95,6 +95,7 @@ def configure_story(env: dict[str, str]) -> None:
             return
         env["STORYFLOW_CLAUDE_CLI"] = path
     env["STORYFLOW_STORY_RUNNER"] = "claude-cli"
+    env["STORYFLOW_STORY_TIMEOUT"] = "1800"  # long stories (>= reference length) need more than the 900 s default
     print("  Lưu ý: nếu chưa đăng nhập, mở cmd gõ `claude` một lần để đăng nhập.")
 
 

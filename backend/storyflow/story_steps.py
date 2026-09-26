@@ -140,12 +140,19 @@ def validate_canon(obj) -> str | None:
 _ABS_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/]|(?:^|[\s\"'(])/(?:home|Users|tmp|var|etc|usr|mnt|root|opt)/")
 
 
-def check_story_text(text: str, store_root: str | None = None) -> str | None:
+MIN_LENGTH_RATIO = 0.85  # a story shorter than this share of target_length is rejected (and rewritten)
+
+
+def check_story_text(text: str, store_root: str | None = None, target_length=None) -> str | None:
     """None when story prose is acceptable, else an error message."""
     if not text.strip():
         return "story is empty"
-    if len(text.split()) < MIN_STORY_WORDS:
+    words = len(text.split())
+    if words < MIN_STORY_WORDS:
         return f"story has fewer than {MIN_STORY_WORDS} words"
+    if isinstance(target_length, int) and not isinstance(target_length, bool) and target_length > 0:
+        if words < target_length * MIN_LENGTH_RATIO:
+            return f"story is too short ({words} words, at least {int(target_length * MIN_LENGTH_RATIO)} required)"
     if "\x00" in text:
         return "story contains NUL bytes"
     if _ABS_PATH_RE.search(text) or (store_root and store_root in text):
@@ -494,6 +501,11 @@ class StoryStep(_JobStep):
             return None
         cfg = dict(workflow_config(db, project).get("story") or {})
         story_cfg = {k: cfg.get(k) for k in ("branch", "direction", "target_length")}
+        if not story_cfg["target_length"]:  # default: at least as long as the reference story
+            try:
+                story_cfg["target_length"] = len(ctx.store.read(snap.meta["artifact_path"]).decode("utf-8").split())
+            except (OSError, UnicodeDecodeError):
+                pass
         gen = None
         for _ in range(2):
             rows = [r for r in self._rows(db, snap.id) if r.canon_analysis_id == canon.id]
@@ -557,7 +569,7 @@ class StoryStep(_JobStep):
                 text = raw.decode("utf-8")
             except UnicodeDecodeError:
                 return self._fail(db, ctx, domain_id, "invalid_story", "story.md is not valid UTF-8")
-            problem = check_story_text(text, str(ctx.store.root))
+            problem = check_story_text(text, str(ctx.store.root), (gen.config or {}).get("target_length"))
             if problem:
                 return self._fail(db, ctx, domain_id, "invalid_story", problem)
             project = _get(db, StoryProject, gen.story_project_id)
@@ -615,7 +627,7 @@ def validate_story_output(packet: TaskPacket, store: ArtifactStore) -> str | Non
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return "story.md is not valid UTF-8"
-    return check_story_text(text, str(store.root))
+    return check_story_text(text, str(store.root), (packet.task_config or {}).get("target_length"))
 
 
 STORY_VALIDATORS = {"canon": validate_canon_output, "story": validate_story_output}

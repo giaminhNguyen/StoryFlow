@@ -67,6 +67,10 @@ Provider states: `ready`, `unavailable` (a dependency is missing; the message sa
 
 Other variables: `STORYFLOW_LOG_LEVEL` (default `info`), `STORYFLOW_LOG_DIR`.
 
+### Story length
+
+Unless the workflow config sets `story.target_length` (words), the story is asked to be **at least as long as the source transcript** (whitespace-separated word count). A story shorter than 85% of the target is rejected and rewritten by the normal retry logic. Long stories take longer: `scripts\setup.bat` sets `STORYFLOW_STORY_TIMEOUT=1800`.
+
 ## 4. Data layout
 
 Everything mutable lives under `runtime\` (git-ignored) unless you override it:

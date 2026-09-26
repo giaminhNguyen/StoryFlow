@@ -96,8 +96,10 @@ def build_story_prompt(canon_json: str, branch: str | None = None, direction: st
     branch_line = (f"Branch (divergence premise, accept it): {branch}" if branch else
                    "Branch: none given. Identify 3-5 leverage points, weigh at most 3-5 candidates in a line "
                    "or two each, pick one with a clear conflict and room to escalate, and move on.")
-    length_line = (f"Target length: about {target_length} words." if target_length else
-                   "Target length: a complete short story.")
+    length_line = (f"Target length: AT LEAST {target_length} words (whitespace-separated words), i.e. as long as "
+                   "or longer than the reference story. Do not summarise, compress or stop early: develop every "
+                   "scene fully with dialogue and action until the length is reached and the story is finished."
+                   if target_length else "Target length: a complete short story.")
     parts = [
         _METHOD,
         "TASK: write a genuinely new alternate-branch story. Define the divergence point and changed "
