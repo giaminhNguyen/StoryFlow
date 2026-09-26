@@ -114,7 +114,16 @@ if errorlevel 1 (
 )
 popd
 
-rem ---- 5. doctor --------------------------------------------------------------
+rem ---- 5. provider configuration (interactive; asks one question at a time) --
+echo.
+set "PYTHONUTF8=1"
+chcp 65001 >nul
+"%PY%" "%ROOT%\scripts\configure_providers.py"
+if errorlevel 1 (
+    echo [setup] WARNING: provider configuration did not complete. Re-run scripts\setup.bat to retry.
+)
+
+rem ---- 6. doctor --------------------------------------------------------------
 echo.
 echo [setup] Running the health check ^(python -m storyflow doctor^)...
 "%PY%" -m storyflow doctor
@@ -125,9 +134,6 @@ if not "!DOC!"=="0" (
 )
 
 echo.
-echo [setup] Optional: real subtitle provider dependencies ^(only needed for STORYFLOW_SUBTITLE_PROVIDER=external^):
-echo [setup]     "%PY%" -m pip install -r "%ROOT%\backend\requirements-subtitle.txt"
-echo [setup] Optional: copy backend\.env.example to backend\.env to select real providers ^(see docs\OPERATIONS.md^).
 echo [setup] Setup complete. Start the app with:  start-app.bat
 
 :ok

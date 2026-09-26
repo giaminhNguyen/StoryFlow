@@ -21,3 +21,6 @@ Desktop.ini
 # Local provider configuration (never commit)
 .env
 *.env.local
+
+backend/.env.bak
+runtime-server.log
