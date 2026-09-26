@@ -286,10 +286,16 @@ class Orchestrator:
         project = db.get(StoryProject, project_id)
         return project is not None and project.status in TERMINAL_PROJECT_STATUSES
 
+    def _handlers(self, db, project_id: str) -> list:
+        """The chain of THIS project: steps that are switched off for its workflow (``enabled`` False, e.g.
+        ``review`` under the fast preset) do not exist for it."""
+        project = db.get(StoryProject, project_id)
+        return [h for h in self.chain if getattr(h, "enabled", None) is None or h.enabled(db, self.ctx, project)]
+
     def _advance_project(self, db, project_id: str, wf: ChannelWorkflow, now, res: TickResult) -> None:
         if self._is_terminal(db, project_id):
             return  # skipped / needs_attention: nothing more to do for this project
-        for handler in self.chain:
+        for handler in self._handlers(db, project_id):
             outcome = _AGAIN
             for _ in range(_MAX_STEP_PASSES):
                 outcome = self._step(db, handler, project_id, wf, now, res)
@@ -304,7 +310,7 @@ class Orchestrator:
         project = db.get(StoryProject, project_id)
         if project is not None and project.status in TERMINAL_PROJECT_STATUSES:
             return ProjectState(None, None, error_code=project.status_reason, terminal=project.status)
-        for handler in self.chain:
+        for handler in self._handlers(db, project_id):
             db.expire_all()
             view = handler.status(db, self.ctx, db.get(StoryProject, project_id))
             if view.status is not StepStatus.COMPLETED:
@@ -444,7 +450,7 @@ class Orchestrator:
         otherwise resume / retry would queue jobs for a project the batch already gave up on."""
         if self._is_terminal(db, project_id):
             return None
-        for handler in self.chain:
+        for handler in self._handlers(db, project_id):
             db.expire_all()
             view = handler.status(db, self.ctx, db.get(StoryProject, project_id))
             if view.status is StepStatus.COMPLETED:

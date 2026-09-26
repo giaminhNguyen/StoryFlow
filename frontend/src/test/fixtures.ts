@@ -1,16 +1,28 @@
 // Snapshot factories for component tests: realistic API payloads with overridable fields.
 import type {
-  AudioInfo, Health, ProjectSnapshot, RunnerSnapshot, StepName, StepSummary, WorkflowSnapshot, WorkflowSummary,
+  AudioInfo, Health, ProjectSnapshot, ReviewInfo, RunnerSnapshot, StepName, StepSummary, WorkflowSnapshot,
+  WorkflowSummary,
 } from "../api/types";
 
 const STEPS: StepName[] = ["source", "canon", "story", "tts", "audio"];
+const STEPS_WITH_REVIEW: StepName[] = ["source", "canon", "story", "review", "tts", "audio"];
 
-export function makeSteps(current: StepName | null, currentStatus: StepSummary["status"] = "in_progress"): StepSummary[] {
-  const idx = current ? STEPS.indexOf(current) : STEPS.length;
-  return STEPS.map((step, i) => ({
+// withReview: the workflow's preset reviews the story, so the API lists the "review" step between story and tts.
+export function makeSteps(current: StepName | null, currentStatus: StepSummary["status"] = "in_progress",
+                          withReview = false): StepSummary[] {
+  const list = withReview ? STEPS_WITH_REVIEW : STEPS;
+  const idx = current ? list.indexOf(current) : list.length;
+  return list.map((step, i) => ({
     step, domain_id: i <= idx ? `${step}-1` : null, error_code: null, job: null,
     status: i < idx ? "completed" : i === idx ? currentStatus : "not_started",
   }));
+}
+
+export function makeReview(over: Partial<ReviewInfo> = {}): ReviewInfo {
+  return {
+    id: "rev-1", round_number: 1, status: "completed", verdict: "approve", summary: "The story keeps the canon.",
+    issue_count: 0, issues: [], revised: false, revised_version_id: null, error_code: null, ...over,
+  };
 }
 
 export function makeAudio(chunks = 3): AudioInfo {
@@ -80,7 +92,7 @@ export function makeWorkflow(over: Partial<WorkflowSnapshot> = {}): WorkflowSnap
 
 export function makeHealth(over: Partial<Health> = {}): Health {
   return {
-    status: "ok", db: { ok: true, schema_revision: "0007_source_feeds", at_head: true },
+    status: "ok", db: { ok: true, schema_revision: "0008_story_reviews", at_head: true },
     runtime: { mode: "embedded", running: true, iteration: 1, errors: 0 },
     runners: { registered: 1, assigned: 0, ready: 1, offline: 0 }, demo: { video_id: "demo-video" },
     version: "0.6.0", ...over,

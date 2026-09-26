@@ -237,6 +237,8 @@ ANALYSIS_ACTIVE_WHERE = "status IN ('queued','processing')"
 AUDIO_RUN_ACTIVE_WHERE = "status IN ('queued','processing')"
 # Phase 4 (0004_pipeline_dedupe): one live (queued/processing/completed) generation per input.
 GENERATION_LIVE_WHERE = "status IN ('queued','processing','completed')"
+# Phase 4.4 (0008): one live review per story version.
+REVIEW_LIVE_WHERE = GENERATION_LIVE_WHERE
 
 
 class ChannelWorkflow(Base):
@@ -401,6 +403,35 @@ class StoryVersion(Base):
     status: Mapped[str] = mapped_column(String(32), default=VersionStatus.ACTIVE.value)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class StoryReview(Base):
+    """One review round of a story version (roadmap 4.4): the verdict, the issues found and, when the workflow's
+    ``review.revise`` is on and the verdict is "revise", the newer StoryVersion the reviewer produced."""
+
+    __tablename__ = "story_reviews"
+    __table_args__ = (
+        Index("ix_story_reviews_story_project_id", "story_project_id"),
+        Index("uq_story_reviews_live_input", "story_version_id", unique=True,
+              sqlite_where=text(REVIEW_LIVE_WHERE)),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    story_project_id: Mapped[str] = mapped_column(ForeignKey("story_projects.id"))
+    story_version_id: Mapped[str] = mapped_column(ForeignKey("story_versions.id"))   # the version that is reviewed
+    round_number: Mapped[int] = mapped_column(Integer, default=1)
+    pipeline_job_id: Mapped[str | None] = mapped_column(ForeignKey("pipeline_jobs.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default=DomainStatus.QUEUED.value)
+    verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)          # approve | revise
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    findings: Mapped[list | None] = mapped_column(JSON, nullable=True)              # [{aspect, severity, note}]
+    revised_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)   # soft reference
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class TTSGeneration(Base):

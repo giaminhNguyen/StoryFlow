@@ -38,7 +38,7 @@ def test_older_db_is_backed_up_verified_then_upgraded_with_data_intact(old_db, t
     assert res.ok and res.action == "upgraded" and res.exit_code == 0
     assert res.from_revision == "0003_story_domain" and res.to_revision == code_head() == revision(old_db)
     backup = Path(res.backup_path)
-    assert backup.parent == bdir and backup.name.startswith("pre-migrate-0003_story_domain-to-0007_source_feeds-")
+    assert backup.parent == bdir and backup.name.startswith("pre-migrate-0003_story_domain-to-0008_story_reviews-")
     manifest = verify_backup(backup)
     assert manifest["schema_revision"] == "0003_story_domain" and manifest["counts"]["workflows"] == 1
     con = sqlite3.connect(str(old_db))

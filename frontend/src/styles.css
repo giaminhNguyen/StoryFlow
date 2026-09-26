@@ -26,6 +26,12 @@ a { color: var(--info); }
 .badge-p-skipped { color: var(--muted); border-style: dotted; }
 .badge-p-needs_attention { color: var(--warn); font-weight: 700; border-width: 2px; }
 .badge-completed, .badge-p-completed { color: var(--ok); font-weight: 600; }
+.badge-verdict-approve { color: var(--ok); font-weight: 600; }
+.badge-verdict-revise { color: var(--warn); font-weight: 700; border-width: 2px; }
+.review-issues { list-style: none; padding: 0; margin: 4px 0; }
+.review-issue { padding: 2px 0; }
+.review-issue-high { color: var(--bad); font-weight: 600; }
+.review-issue-medium { color: var(--warn); }
 .chip-ok { color: var(--ok); } .chip-warn { color: var(--warn); } .chip-bad { color: var(--bad); }
 .banner { padding: 8px 12px; margin: 8px 0; border-radius: 4px; border: 1px solid; }
 .banner-warn { background: #fff8e1; color: var(--warn); border-color: var(--warn); text-align: center; margin: 0; border-radius: 0; }

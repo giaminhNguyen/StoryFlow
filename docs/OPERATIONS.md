@@ -96,6 +96,22 @@ One workflow can hold many videos. Send sources to `POST /api/workflows/{id}/sou
 * Videos are picked up in listing order. For a batch use `"failure_policy": {"on_no_subtitle": "skip",
   "on_permanent_error": "continue"}` (below) so one bad video does not stop the rest.
 
+### Presets: Fast / Balanced / Quality (review and revision)
+
+`"preset"` in the workflow config chooses how much quality control runs after the story is written (recorded as
+`preset` + `review` when the workflow is created; default **fast**):
+
+| Preset | Pipeline | Extra cost |
+|---|---|---|
+| `fast` | source, canon, story, tts, audio | none |
+| `balanced` | ... story, **review**, tts, audio: an editor call checks canon, logic, style and length and records the verdict + issues; the story is not changed | one more model call per story |
+| `quality` | ... story, **review**, tts, audio: the editor also returns a **corrected story** (a new story version that TTS reads); up to 2 rounds (the corrected story is reviewed again) | up to 2 more calls, each with a full story in and out |
+
+An explicit `"review": {"enabled": true, "revise": false, "max_rounds": 1}` overrides the preset. The review is ONE call
+that covers all four aspects (parallel reviewer "teams" would need more than one model runner). A failed review is handled
+like any failed step (`failure_policy`). The verdict, the issues and the revision count are shown in the project detail
+(`review`, `revision_count` in the API).
+
 ### Failure policy (subtitles and batches)
 
 `failure_policy` in the workflow config decides what happens when ONE video fails. New workflows get

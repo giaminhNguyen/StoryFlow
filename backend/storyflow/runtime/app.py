@@ -35,6 +35,7 @@ from ..models import utcnow
 from ..orchestrator import Orchestrator
 from ..pipeline import OutputValidatingRunner, PipelineContext
 from ..protocol import ResultCode
+from ..review_steps import REVIEW_VALIDATORS, FakeReviewRunner, ReviewStep
 from ..roles import Role
 from ..story_steps import STORY_VALIDATORS, CanonStep, FakeStoryPipelineRunner, SourceStep, StoryStep
 from ..subtitles import FakeSubtitleClient, SubtitleClient
@@ -43,7 +44,7 @@ from .loop import Runtime
 from .supervisor import RunnerProvider, RunnerSupervisor, StaticRunnerProvider
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
-_PIPELINE_VALIDATORS = {**STORY_VALIDATORS, **TTS_VALIDATORS}
+_PIPELINE_VALIDATORS = {**STORY_VALIDATORS, **REVIEW_VALIDATORS, **TTS_VALIDATORS}
 _SCHEMA_LOCK = threading.Lock()
 FAKE_CHUNKING = {"preferred_chunk_chars_max": 60, "avoid_chunk_below_chars": 10}
 
@@ -67,9 +68,11 @@ class PipelineRouter(AgentRunner):
     def __init__(self, store: ArtifactStore, *, runner_type: str = "fake", chunking: dict | None = None):
         self.runner_type = runner_type
         self.story = FakeStoryPipelineRunner(store)
+        self.review = FakeReviewRunner(store)          # approves unless scripted (``review.verdicts``)
         self.tts = FakeTTSAdapterRunner(store, chunking=chunking or FAKE_CHUNKING)
         self.audio = FakeAudioRunner(store)
-        self._routes = {"canon": self.story, "story": self.story, "tts": self.tts, "audio": self.audio}
+        self._routes = {"canon": self.story, "story": self.story, "review": self.review, "tts": self.tts,
+                        "audio": self.audio}
 
     def execute(self, packet):
         return self._routes[packet.task_config["step"]].execute(packet)
@@ -230,7 +233,8 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
                           inbox_dir=stack.config.resolved_inbox_dir() if stack is not None else None)
     registry = RunnerRegistry()
     dispatcher = Dispatcher(registry)
-    orchestrator = Orchestrator(ctx, dispatcher, SourceStep(), [CanonStep(), StoryStep(), TTSStep(), AudioStep()])
+    orchestrator = Orchestrator(ctx, dispatcher, SourceStep(),
+                              [CanonStep(), StoryStep(), ReviewStep(), TTSStep(), AudioStep()])
     supervisor = RunnerSupervisor(session_factory, registry, providers, clock=clock,
                                   wrap=lambda r: wrap_runner_for_pipeline(r, store))
     runtime = Runtime(ctx, orchestrator, supervisor, **runtime_kwargs)

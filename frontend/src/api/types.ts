@@ -5,7 +5,8 @@ export type DisplayState =
   | "draft" | "active" | "paused" | "waiting_capacity" | "failed" | "blocked" | "cancelled" | "completed";
 
 export type WorkflowStatus = "draft" | "active" | "paused" | "finished" | "cancelled" | "abandoned";
-export type StepName = "source" | "canon" | "story" | "tts" | "audio";
+// "review" only exists for workflows whose preset reviews the story (balanced / quality)
+export type StepName = "source" | "canon" | "story" | "review" | "tts" | "audio";
 export type StepStatus = "not_started" | "in_progress" | "completed" | "failed";
 export type ProjectState =
   | "completed" | "failed" | "blocked" | "waiting_capacity" | "in_progress" | "not_started"
@@ -43,6 +44,15 @@ export interface AudioInfo {
   id: string; run_number: number; status: string; chunk_count: number; store_dir: string | null;
   error_code: string | null; registered_chunks: number; chunks: AudioChunkInfo[];
 }
+export type ReviewVerdict = "approve" | "revise";
+export type IssueSeverity = "low" | "medium" | "high";
+export interface ReviewIssue { aspect: string; severity: IssueSeverity | string; note: string }
+// The latest review round of a project: verdict, issues (capped by the API) and whether it revised the story.
+export interface ReviewInfo {
+  id: string; round_number: number; status: string; verdict: ReviewVerdict | null; summary: string | null;
+  issue_count: number; issues: ReviewIssue[]; revised: boolean; revised_version_id: string | null;
+  error_code: string | null;
+}
 export interface BlockInfo { kind: BlockKind; message: string | null; until: string | null }
 export interface FailureInfo {
   category: FailureCategory; code: string | null; message: string | null; step: string | null;
@@ -60,6 +70,8 @@ export interface ProjectSnapshot {
   // batch outcome (failure policy) and source retry state; absent on older backends
   status_reason?: string | null; status_detail?: Record<string, unknown> | null;
   source_attempts?: number; next_attempt_at?: string | null;
+  // review step (balanced / quality presets); absent on older backends
+  review?: ReviewInfo | null; revision_count?: number;
 }
 
 export interface RunnerSnapshot {
@@ -83,6 +95,7 @@ export interface WorkflowSummary {
   id: string; name: string; mode: string; status: WorkflowStatus; status_reason: string | null;
   display_state: DisplayState; project_count: number; completed_projects: number;
   session_id: string | null; created_at: string | null; updated_at: string | null; finished_at: string | null;
+  preset?: string | null;   // fast | balanced | quality (absent on older backends)
 }
 export interface WorkflowSnapshot extends Omit<WorkflowSummary, "completed_projects"> {
   status_detail: Record<string, unknown> | null;

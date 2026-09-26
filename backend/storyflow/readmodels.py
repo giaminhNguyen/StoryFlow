@@ -63,6 +63,7 @@ from .models import (
     JobStatus,
     PauseReason,
     ProjectStatus,
+    StoryReview,
     PipelineJob,
     RunnerInstance,
     RunnerState,
@@ -88,7 +89,8 @@ BUSINESS, INFRASTRUCTURE, CAPACITY, PROVIDER, UNKNOWN = (
 _CATEGORY_CODES = {
     BUSINESS: {"task_failed", "invalid_output", "invalid_canon", "invalid_story", "missing_output",
                "partial_failure", "chunks_missing", "empty_source", "source_not_configured", "inbox_file_missing",
-               "project_not_found", "job_failed", "missing_input", "bad_output_path", "unknown_step"},
+               "project_not_found", "job_failed", "missing_input", "bad_output_path", "unknown_step",
+               "invalid_review", "review_failed"},
     INFRASTRUCTURE: {"infra_exhausted", "lease_expired", "runner_crashed", "timeout",
                      "transient_failure", "rate_limited", "quota_exhausted", "auth_error"},
     CAPACITY: {"all_agents_unavailable"},
@@ -109,7 +111,8 @@ BLOCK_DELAYED = "delayed"
 BLOCK_INCONSISTENT = "inconsistent"
 _BLOCKING_KINDS = (BLOCK_CHUNKS_MISSING, BLOCK_PROVIDER_BLOCKED, BLOCK_INCONSISTENT)
 
-_STEP_DEDUPE_PREFIX = {"canon": "canon", "story": "story", "tts": "tts", "audio": "audio"}
+_STEP_DEDUPE_PREFIX = {"canon": "canon", "story": "story", "review": "review", "tts": "tts", "audio": "audio"}
+_MAX_REVIEW_ISSUES = 20      # issues shown per review in a snapshot (each note is also bounded)
 
 # ---------------------------------------------------------------------------- sanitising
 
@@ -300,6 +303,22 @@ class CapacitySummary:
 
 
 @dataclass(frozen=True)
+class ReviewInfo:
+    """The latest review round of a project (roadmap 4.4): verdict, issues and whether the story was revised."""
+
+    id: str
+    round_number: int
+    status: str                       # queued|processing|completed|failed|cancelled
+    verdict: str | None               # approve | revise (None until the round completed)
+    summary: str | None
+    issue_count: int                  # all issues found (issues below is capped)
+    issues: list = field(default_factory=list)      # [{"aspect", "severity", "note"}]
+    revised: bool = False             # this round produced a newer story version
+    revised_version_id: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
 class ProjectSnapshot:
     id: str
     workflow_id: str | None
@@ -325,6 +344,8 @@ class ProjectSnapshot:
     next_attempt_at: datetime | None = None
     video_id: str | None = None      # ledger key (which YouTube video this project is about)
     feed_id: str | None = None       # channel / playlist feed it came from, if any
+    review: ReviewInfo | None = None  # latest review round (None when the workflow has no review step / not reached)
+    revision_count: int = 0          # active story versions beyond the first (= revisions made by reviews)
 
 
 @dataclass(frozen=True)
@@ -372,6 +393,7 @@ class WorkflowSummary:
     # Projects whose audio run completed (aggregate approximation of "all steps completed";
     # exact per-step progress is in WorkflowSnapshot.counts).
     completed_projects: int = 0
+    preset: str | None = None        # fast | balanced | quality as recorded in the workflow config
 
 
 @dataclass(frozen=True)
@@ -392,6 +414,7 @@ class WorkflowSnapshot:
     projects: list = field(default_factory=list)   # list[ProjectSnapshot]
     runners: list = field(default_factory=list)    # list[RunnerSnapshot]
     capacity: CapacitySummary | None = None
+    preset: str | None = None        # fast | balanced | quality as recorded in the workflow config
 
 
 # ---------------------------------------------------------------------------- to_jsonable
@@ -508,6 +531,25 @@ def _job_summary(j: PipelineJob | None) -> JobSummary | None:
         last_error_message=_bound(j.last_error_message), outcome=j.outcome)
 
 
+def _preset_of(config) -> str | None:
+    """The preset name recorded in a workflow config (short text only), else None."""
+    value = config.get("preset") if isinstance(config, dict) else None
+    return value[:32] if isinstance(value, str) and value else None
+
+
+def _review_info(row: StoryReview) -> ReviewInfo:
+    issues = []
+    for item in (row.findings or []):
+        if isinstance(item, dict):
+            issues.append({"aspect": _bound(str(item.get("aspect", "other")), 32),
+                           "severity": _bound(str(item.get("severity", "low")), 16),
+                           "note": _bound(str(item.get("note", "")))})
+    return ReviewInfo(
+        id=row.id, round_number=row.round_number or 1, status=row.status, verdict=row.verdict,
+        summary=_bound(row.summary), issue_count=len(issues), issues=issues[:_MAX_REVIEW_ISSUES],
+        revised=bool(row.revised_version_id), revised_version_id=row.revised_version_id, error_code=row.error_code)
+
+
 def _display_from(status: str, reason: str | None, project_states: list) -> str:
     """project_states: list of (state, block_kind) ."""
     if status == ChannelWorkflowStatus.DRAFT.value:
@@ -596,7 +638,7 @@ class ReadModels:
                     display_state=_display_from(w.status, w.status_reason, states),
                     project_count=counts.get(w.id, 0), session_id=w.workflow_session_id,
                     created_at=w.created_at, updated_at=w.updated_at, finished_at=w.finished_at,
-                    completed_projects=done.get(w.id, 0)))
+                    completed_projects=done.get(w.id, 0), preset=_preset_of(w.config)))
             return out
 
     def get_workflow(self, workflow_id: str) -> WorkflowSnapshot:
@@ -632,7 +674,8 @@ class ReadModels:
                 status_detail=dict(wf.status_detail) if wf.status_detail else None,
                 display_state=display, project_count=len(snaps), counts=WorkflowCounts(**tally),
                 session_id=wf.workflow_session_id, created_at=wf.created_at, updated_at=wf.updated_at,
-                finished_at=wf.finished_at, projects=snaps, runners=runners, capacity=capacity)
+                finished_at=wf.finished_at, projects=snaps, runners=runners, capacity=capacity,
+                preset=_preset_of(wf.config))
 
     def list_feeds(self, workflow_id: str) -> list[FeedSnapshot]:
         """Channels / playlists expanded into this workflow, with how many of their projects ended early."""
@@ -716,6 +759,8 @@ class ReadModels:
         steps, jobs, views = [], {}, {}
         current = None
         for handler in self.chain:
+            if getattr(handler, "enabled", None) is not None and not handler.enabled(db, self.ctx, project):
+                continue   # a step switched off for this workflow (e.g. review under the fast preset)
             view = handler.status(db, self.ctx, project)
             views[handler.step] = view
             job = self._find_job(db, handler.step, view.domain_id, view.pipeline_job_id) \
@@ -783,6 +828,12 @@ class ReadModels:
                 chunks=[AudioChunkInfo(c.chunk_index, _rel(c.artifact_path), c.duration_ms or 0)
                         for c in chunk_rows])
 
+        review_row = db.scalars(select(StoryReview).where(StoryReview.story_project_id == project.id)
+                                .order_by(StoryReview.round_number.desc(), StoryReview.created_at.desc(),
+                                          StoryReview.id).limit(1), **_FRESH).first()
+        revision_count = max((db.scalar(select(func.count()).select_from(StoryVersion).where(
+            StoryVersion.story_project_id == project.id, StoryVersion.status == VersionStatus.ACTIVE.value)) or 0) - 1,
+            0)
         block = self._block(wf, project, current, cur_view, jobs.get(current) if current else None,
                             audio_row, registered, tts_info, now)
         failure = self._failure(wf, project, current, cur_view, jobs.get(current) if current else None)
@@ -800,7 +851,8 @@ class ReadModels:
             block=block, failure=failure, status_reason=project.status_reason,
             status_detail=dict(project.status_detail) if project.status_detail else None,
             source_attempts=project.source_attempts or 0, next_attempt_at=project.next_attempt_at,
-            video_id=project.video_id, feed_id=project.feed_id)
+            video_id=project.video_id, feed_id=project.feed_id,
+            review=_review_info(review_row) if review_row is not None else None, revision_count=revision_count)
 
     @staticmethod
     def _state(current, cur_view, block, failure) -> str:

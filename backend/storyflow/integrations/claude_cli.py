@@ -12,8 +12,9 @@ Invocation (verified against ``claude --help``, v2.1.x):
   ``STORYFLOW_*`` key. Credentials belong to the CLI's own login: StoryFlow never reads, stores or
   logs them and never probes authentication.
 
-The runner only produces text: it reads input artifacts through the ArtifactStore, writes exactly one
-output artifact through ``store.write`` and leaves business validation (schema / story length) to the
+The runner only produces text: it reads input artifacts through the ArtifactStore, writes its declared output
+artifact through ``store.write`` (canon.json, story.md; the ``review`` step writes review.json and, when asked to
+revise, story_revised.md) and leaves business validation (schema / story length) to the
 ``OutputValidatingRunner`` wrapper. Prompts and model output are never logged, never put in metrics and
 never put in a RunnerResult message (messages are fixed strings, scrubbed and bounded to 300 chars).
 """
@@ -31,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 
@@ -119,6 +121,62 @@ def build_story_prompt(canon_json: str, branch: str | None = None, direction: st
     ]
     if source_text:
         parts.append("=== REFERENCE STORY ===\n" + source_text + "\n=== END REFERENCE STORY ===")
+    return "\n\n".join(parts) + "\n"
+
+
+REVISED_DELIMITER = "=== REVISED STORY ==="
+REVIEW_ASPECTS = ("canon", "logic", "style", "length", "other")
+REVIEW_SEVERITIES = ("low", "medium", "high")
+MAX_REVIEW_ISSUES = 50
+_ISSUE_NOTE_LIMIT = 500
+_SUMMARY_LIMIT = 500
+
+_REVIEW_SCHEMA_TEXT = json.dumps({
+    "version": 1,
+    "verdict": "approve | revise",
+    "summary": "one or two sentences, non-empty",
+    "issues": [{"aspect": "canon | logic | style | length | other", "severity": "low | medium | high",
+                "note": "what is wrong and where, non-empty"}],
+}, ensure_ascii=False, indent=2)
+
+
+def build_review_prompt(source_text: str, canon_json: str, story_text: str, *, revise: bool,
+                        target_length: int | str | None = None) -> str:
+    """Prompt asking an editor to review a finished story: ONLY a JSON verdict, plus (when ``revise``) the
+    corrected story after a fixed delimiter line."""
+    length_line = (f"Length: the story must stay AT LEAST {target_length} words (whitespace-separated words); report "
+                   "a 'length' issue when it is clearly shorter, or padded with filler." if target_length else
+                   "Length: judge whether the story feels complete and proportionate; report a 'length' issue if not.")
+    if revise:
+        output = (
+            "OUTPUT FORMAT: first ONE JSON object exactly like the schema below (nothing before it; no commentary). "
+            "If the verdict is \"revise\", then on its own line write exactly "
+            f"{REVISED_DELIMITER} and after it the COMPLETE corrected story as Markdown: the same language as the "
+            "story, fixing every issue you listed, changing only what is needed, at least as long as the story "
+            "under review, no commentary, no notes, no code fence, never mention file paths. If the verdict is "
+            "\"approve\", output the JSON object only and NO revised story."
+        )
+    else:
+        output = (
+            "OUTPUT FORMAT: ONE JSON object exactly like the schema below and nothing else (no commentary, no "
+            "revised story). Do not rewrite the story; only judge it."
+        )
+    parts = [
+        "TASK: review the finished story below as a strict editor. Compare it with the canon and the reference "
+        "story and judge four aspects: (1) canon - character names, identities, relationships and established "
+        "facts stay consistent, and any deliberate change is explained; (2) logic - causes and consequences hold, "
+        "nobody knows what they could not know, no plot holes or contradictions; (3) style - pacing, scene "
+        "structure, dialogue, a hook and a satisfying ending, no repetition; (4) length. Verdict \"approve\" when "
+        "the story is good enough to be read aloud as it is; \"revise\" when at least one issue is serious. "
+        "Minor taste issues never justify \"revise\".",
+        length_line,
+        output,
+        "Schema (all strings non-empty, at most 50 issues, an empty issues list is fine):\n" + _REVIEW_SCHEMA_TEXT,
+        "=== CANON (JSON) ===\n" + canon_json + "\n=== END CANON ===",
+    ]
+    if source_text:
+        parts.append("=== REFERENCE STORY ===\n" + source_text + "\n=== END REFERENCE STORY ===")
+    parts.append("=== STORY UNDER REVIEW ===\n" + story_text + "\n=== END STORY UNDER REVIEW ===")
     return "\n\n".join(parts) + "\n"
 
 
@@ -218,6 +276,83 @@ def extract_json_object(text: str) -> str | None:
     return text[start:end + 1]
 
 
+class ReviewParseError(ValueError):
+    """The model's review answer cannot be turned into review.json (+ story_revised.md)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+_DELIMITER_LINE = re.compile(r"^[ \t]*" + re.escape(REVISED_DELIMITER) + r"[ \t\r]*$", re.M)
+
+
+def _strip_story_fences(text: str) -> str:
+    """The revised story without a wrapping code fence (also a lone closing fence left by one wrapping the
+    whole answer)."""
+    text = strip_fences(text.strip())
+    lines = text.rstrip().split("\n")
+    fences = [i for i, line in enumerate(lines) if line.lstrip().startswith("```")]
+    if len(fences) % 2 == 1 and lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _clean_issue(raw) -> dict | None:
+    if isinstance(raw, str):
+        raw = {"note": raw}
+    if not isinstance(raw, dict):
+        return None
+    raw_note = raw.get("note")
+    note = scrub_message(raw_note.strip(), _ISSUE_NOTE_LIMIT).strip() if isinstance(raw_note, str) else ""
+    if not note:
+        return None
+    aspect = str(raw.get("aspect", "")).strip().lower()
+    severity = str(raw.get("severity", "")).strip().lower()
+    return {"aspect": aspect if aspect in REVIEW_ASPECTS else "other",
+            "severity": severity if severity in REVIEW_SEVERITIES else "medium", "note": note}
+
+
+def parse_review_output(text: str, *, revise: bool) -> tuple[dict, str | None]:
+    """Model answer -> (review.json dict, revised story or None). Raises ReviewParseError.
+
+    The answer is one JSON object, optionally followed by a ``=== REVISED STORY ===`` line and the corrected
+    story. Fences are tolerated. A revised story is only returned when ``revise`` is on AND the verdict is
+    "revise"; a story the model volunteers otherwise is ignored. Unknown aspects / severities are normalised,
+    issues are capped and scrubbed (paths and token-like strings never reach the artifact)."""
+    match = _DELIMITER_LINE.search(text)
+    head, tail = (text[:match.start()], text[match.end():]) if match else (text, None)
+    payload = extract_json_object(head)
+    if payload is None:
+        raise ReviewParseError("no_json", "claude CLI returned no JSON review")
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        raise ReviewParseError("bad_json", "claude CLI review is not valid JSON") from None
+    if not isinstance(obj, dict):
+        raise ReviewParseError("bad_json", "claude CLI review is not a JSON object")
+    verdict = str(obj.get("verdict", "")).strip().lower()
+    if verdict not in ("approve", "revise"):
+        raise ReviewParseError("bad_verdict", "claude CLI review verdict must be approve or revise")
+    summary = scrub_message(str(obj.get("summary") or "").strip(), _SUMMARY_LIMIT).strip() or f"Verdict: {verdict}."
+    raw_issues = obj.get("issues")
+    issues = []
+    for raw in (raw_issues if isinstance(raw_issues, list) else []):
+        issue = _clean_issue(raw)
+        if issue is not None:
+            issues.append(issue)
+        if len(issues) >= MAX_REVIEW_ISSUES:
+            break
+    review = {"version": 1, "verdict": verdict, "summary": summary, "issues": issues}
+    if not (revise and verdict == "revise"):
+        return review, None
+    story = _strip_story_fences(tail) if tail is not None else ""
+    if not story:
+        raise ReviewParseError("no_revised_story", "claude CLI review asked for a revision but returned no story")
+    return review, story + "\n"
+
+
 # --- process helpers ---------------------------------------------------------------------
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -296,6 +431,44 @@ def _read_input(store: ArtifactStore, rel, project_id) -> str:
     return store.read(rel).decode("utf-8")
 
 
+@dataclass(frozen=True)
+class _ReviewTarget:
+    """Where a review packet's answer goes: ``review.json`` and, when ``revise``, ``story_revised.md``."""
+
+    review: str
+    revised: str | None
+    revise: bool
+
+
+_REVIEW_FILES = ("review.json", "story_revised.md")
+
+
+def _review_targets(packet: TaskPacket, store: ArtifactStore, revise: bool) -> _ReviewTarget:
+    """Validate the output paths of a review packet (like safe_output_path, but one or two files): relative,
+    traversal safe, under projects/<project_id>/, named review.json [+ story_revised.md] in the same folder."""
+    outputs = packet.outputs or []
+    wanted = 2 if revise else 1
+    if len(outputs) != wanted or not all(isinstance(o, str) for o in outputs):
+        raise OutputPathError(f"packet must list exactly {wanted} output path(s)")
+    pid = (packet.inputs or {}).get("project_id")
+    if not pid:
+        raise OutputPathError("packet.inputs.project_id missing")
+    folders = []
+    for rel, filename in zip(outputs, _REVIEW_FILES):
+        try:
+            store.resolve(rel)
+        except PathTraversalError as exc:
+            raise OutputPathError(f"unsafe output path: {rel}") from exc
+        path = PurePosixPath(rel.replace("\\", "/"))
+        parts = path.parts
+        if len(parts) < 3 or parts[0] != "projects" or parts[1] != pid or parts[-1] != filename:
+            raise OutputPathError(f"output path must be projects/{pid}/.../{filename}")
+        folders.append(path.parent)
+    if len(set(folders)) > 1:
+        raise OutputPathError("review outputs must share one directory")
+    return _ReviewTarget(outputs[0], outputs[1] if revise else None, revise)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -332,10 +505,13 @@ class ClaudeCliRunner(AgentRunner):
 
     def execute(self, packet: TaskPacket) -> RunnerResult:
         step = (packet.task_config or {}).get("step")
-        if step not in ("canon", "story"):
+        if step not in ("canon", "story", "review"):
             return _fail(ResultCode.TASK_FAILED, "unsupported_step", "unsupported step")
         try:
-            rel = safe_output_path(packet, self.store, "canon.json" if step == "canon" else "story.md")
+            if step == "review":
+                rel = _review_targets(packet, self.store, _wants_revision(packet))
+            else:
+                rel = safe_output_path(packet, self.store, "canon.json" if step == "canon" else "story.md")
             prompt = self._build_prompt(packet, step)
         except OutputPathError:
             return _fail(ResultCode.TASK_FAILED, "bad_path", "packet path rejected")
@@ -371,6 +547,11 @@ class ClaudeCliRunner(AgentRunner):
         source = None
         if inputs.get("source_artifact"):
             source = _read_input(self.store, inputs["source_artifact"], pid)
+        if step == "review":
+            story = _read_input(self.store, inputs.get("story_artifact"), pid)
+            target = inputs.get("target_length") or (packet.task_config or {}).get("target_length")
+            return build_review_prompt(source or "", canon, story, revise=_wants_revision(packet),
+                                       target_length=target)
         return build_story_prompt(canon, inputs.get("branch"), inputs.get("direction"),
                                   inputs.get("target_length"), source)
 
@@ -430,7 +611,7 @@ class ClaudeCliRunner(AgentRunner):
             return _fail(ResultCode.INVALID_OUTPUT, "output_too_large", "claude CLI output too large")
         return self._finish(step, rel, proc.returncode, bytes(out.data), bytes(err.data), duration_ms)
 
-    def _finish(self, step: str, rel: str, code: int, stdout: bytes, stderr: bytes, duration_ms: int) -> RunnerResult:
+    def _finish(self, step: str, rel, code: int, stdout: bytes, stderr: bytes, duration_ms: int) -> RunnerResult:
         try:
             out_text = stdout.decode("utf-8")
             err_text = stderr.decode("utf-8", errors="replace")
@@ -460,6 +641,8 @@ class ClaudeCliRunner(AgentRunner):
             return _fail(ResultCode.INVALID_OUTPUT, "invalid_envelope", "claude CLI output is not a JSON result")
         if not result_text.strip():
             return _fail(ResultCode.INVALID_OUTPUT, "empty_result", "claude CLI returned no text")
+        if step == "review":
+            return self._finish_review(rel, result_text, envelope, duration_ms)
         if step == "canon":
             payload = extract_json_object(result_text)
             if payload is None:
@@ -468,6 +651,19 @@ class ClaudeCliRunner(AgentRunner):
             payload = strip_fences(result_text).strip() + "\n"
         self.store.write(rel, payload.encode("utf-8"))
         return RunnerResult(ResultCode.SUCCESS, artifacts={"outputs": [rel]}, metrics=_metrics(envelope, duration_ms))
+
+    def _finish_review(self, target: "_ReviewTarget", result_text: str, envelope: dict,
+                       duration_ms: int) -> RunnerResult:
+        try:
+            review, revised = parse_review_output(result_text, revise=target.revise)
+        except ReviewParseError as exc:
+            return _fail(ResultCode.INVALID_OUTPUT, exc.code, exc.message)
+        outputs = [target.review]
+        self.store.write(target.review, (json.dumps(review, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        if revised is not None and target.revised is not None:
+            self.store.write(target.revised, revised.encode("utf-8"))
+            outputs.append(target.revised)
+        return RunnerResult(ResultCode.SUCCESS, artifacts={"outputs": outputs}, metrics=_metrics(envelope, duration_ms))
 
 
 def _metrics(envelope: dict, duration_ms: int) -> dict:
@@ -485,6 +681,12 @@ def _metrics(envelope: dict, duration_ms: int) -> dict:
             if number(usage.get(key)) is not None:
                 metrics[key] = usage[key]
     return metrics
+
+
+def _wants_revision(packet: TaskPacket) -> bool:
+    """Does this review packet ask for a corrected story? (task_config wins over inputs; anything but True = no)"""
+    cfg, inputs = packet.task_config or {}, packet.inputs or {}
+    return (cfg["revise"] if "revise" in cfg else inputs.get("revise", False)) is True
 
 
 def _fail(code: ResultCode, error_code: str, message: str) -> RunnerResult:

@@ -55,6 +55,7 @@ from .models import (
 from .orchestrator import Orchestrator
 from .pipeline import PipelineContext
 from .policy import RECOMMENDED, RECOMMENDED_BATCH_SETTINGS, PolicyError, parse_batch_settings, parse_failure_policy
+from .presets import PresetError, apply_preset
 from .roles import Role
 
 _FRESH = {"execution_options": {"populate_existing": True}}
@@ -218,6 +219,10 @@ class WorkflowService:
             config = {**config, "failure_policy": dict(RECOMMENDED)}
         if "batch" not in config:  # record how many projects run at once (a batch must not hit YouTube all at once)
             config = {**config, "batch": dict(RECOMMENDED_BATCH_SETTINGS)}
+        try:
+            config = apply_preset(config)   # validates preset / review and records what applies (default: fast)
+        except PresetError as exc:
+            raise ValidationFailed(str(exc), reason="invalid_preset") from None
         role_preferences = self._validate_role_preferences(role_preferences)
         if client_key is not None and (not isinstance(client_key, str) or not client_key.strip()
                                        or len(client_key) > 128):

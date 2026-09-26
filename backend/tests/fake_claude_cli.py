@@ -19,7 +19,35 @@ CANON = {
     "events": [{"id": "e1", "summary": "the secret is found"}, {"id": "e2", "summary": "it spreads", "causes": ["e1"]}],
     "leverage_points": [{"id": "l1", "description": "who finds the secret first"}],
 }
+REVIEW_MODES = ("success", "review_approve", "review_revise", "review_fenced", "review_bad_json",
+                "review_no_delimiter", "review_bad_verdict")
+REVIEW_APPROVE = {"version": 1, "verdict": "approve", "summary": "The story is consistent with the canon.",
+                  "issues": [{"aspect": "style", "severity": "low", "note": "Pacing dips slightly in the middle."}]}
+REVIEW_REVISE = {"version": 1, "verdict": "revise", "summary": "Two serious problems were found.",
+                 "issues": [{"aspect": "canon", "severity": "high", "note": "Oren changes his name in scene two."},
+                            {"aspect": "logic", "severity": "medium", "note": "Mira knows the secret too early."}]}
 STORY = "# The Other Door\n\nMira opens the other door and the rivalry with Oren changes for good. " * 3
+
+
+def review_answer(mode, stdin, story):
+    """Answer to a review prompt (the prompt contains ``TASK: review``) for the given review mode."""
+    if mode in ("success", "review_approve"):
+        return json.dumps(REVIEW_APPROVE)
+    if mode == "review_fenced":
+        return "Here is my review:\n```json\n" + json.dumps(REVIEW_APPROVE) + "\n```"
+    if mode == "review_bad_json":
+        return "I liked the story a lot, well done!"
+    if mode == "review_bad_verdict":
+        return json.dumps({**REVIEW_APPROVE, "verdict": "maybe"})
+    if mode == "review_no_delimiter":
+        return json.dumps(REVIEW_REVISE)
+    # review_revise: verdict + delimiter + a corrected story at least as long as the story under review
+    m = re.search(r"=== STORY UNDER REVIEW ===\n(.*?)\n=== END STORY UNDER REVIEW ===", stdin, re.S)
+    needed = len(m.group(1).split()) if m else 0
+    revised = story
+    while len(revised.split()) < needed:
+        revised += STORY
+    return json.dumps(REVIEW_REVISE) + "\n=== REVISED STORY ===\n" + revised
 
 
 def envelope(result, **extra):
@@ -54,6 +82,10 @@ def main():
     wanted = re.search(r"AT LEAST (\d+) words", stdin)  # honour the length asked for in the prompt
     while wanted and len(story.split()) < int(wanted.group(1)):
         story += STORY
+    if "TASK: review" in stdin and mode in REVIEW_MODES:
+        out.write(envelope(review_answer(mode, stdin, story)))
+        out.flush()
+        return 0
     if mode == "success":
         out.write(envelope(json.dumps(CANON) if is_canon else story))
     elif mode == "fenced":

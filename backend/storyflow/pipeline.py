@@ -105,6 +105,11 @@ class StepHandler(abc.ABC):
     job_kind: str = ""
     role: str = ""
 
+    def enabled(self, db, ctx: PipelineContext, project: StoryProject) -> bool:
+        """False = this step does not exist for this project's workflow (e.g. ``review`` under the ``fast``
+        preset): the orchestrator and the read models skip it. Pure read; default True."""
+        return True
+
     @abc.abstractmethod
     def status(self, db, ctx: PipelineContext, project: StoryProject) -> StepView:
         """Pure read of durable state for this step's current input (missing input ->
@@ -137,6 +142,9 @@ class InlineStepHandler(abc.ABC):
     acquisition via SubtitleClient). Same rules: no DB transaction held during external I/O."""
 
     step: str = ""
+
+    def enabled(self, db, ctx: PipelineContext, project: StoryProject) -> bool:
+        return True
 
     @abc.abstractmethod
     def status(self, db, ctx: PipelineContext, project: StoryProject) -> StepView: ...

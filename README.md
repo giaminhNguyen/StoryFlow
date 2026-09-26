@@ -85,6 +85,7 @@ Current migration head:
 → 0005_control_plane
 → 0006_source_policy
 → 0007_source_feeds
+→ 0008_story_reviews
 ```
 
 ### Post-MVP roadmap progress (batch operation)
@@ -95,7 +96,7 @@ Current migration head:
 | P1 failure policy: subtitle backoff/retry limit, `skipped` / `needs_attention` projects, batch keeps going (migration `0006`) | done - see `docs/OPERATIONS.md` "Failure policy" |
 | P2 channel / playlist / video-list / local-file input, processed-video ledger, sync of new videos, subtitle inbox (migration `0007`, `POST /api/workflows/{id}/sources`, `/sync`, `GET .../feeds`) | done - see `docs/OPERATIONS.md` "Adding videos, playlists and channels" |
 | P3 batch orchestration: `batch.max_active` window (overlap without flooding YouTube), a failed AI/TTS step ends only that project (`on_permanent_error: continue`), `POST /api/projects/{id}/retry` | done - see `docs/OPERATIONS.md` "How many projects run at once" |
-| P4 review + revision, presets (Fast / Balanced / Quality) | planned |
+| P4 review + revision and presets: `"preset": "fast"` (default) / `"balanced"` (an editor call records verdict + issues) / `"quality"` (the editor also returns a corrected story, up to 2 rounds) (migration `0008`) | done - see `docs/OPERATIONS.md` "Presets" |
 
 Phase 9 validation: backend `684 passed, 6 skipped` on three independent runs (Phase 8: 541, Phase 7: 422, Phase 6: 420, Phase 5: 333, Phase 4: 198). Skips are symlink tests on Windows without symlink privilege.
 

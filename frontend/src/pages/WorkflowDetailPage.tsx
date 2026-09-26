@@ -61,6 +61,7 @@ export function WorkflowDetailPage({ workflowId, client }: { workflowId: string;
       <header className="detail-head">
         <h1>{wf.name}</h1>
         <StateBadge state={wf.display_state} />
+        {wf.preset && <span className="chip" data-testid="workflow-preset" title="Workflow preset">preset: {wf.preset}</span>}
       </header>
       <p className="status-reason">{statusExplanation(wf)}</p>
       <p className="counts" aria-label="Project counts">

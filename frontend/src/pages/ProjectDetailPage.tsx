@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { ApiError, type ApiClient } from "../api/client";
 import type { ProjectSnapshot } from "../api/types";
 import { AudioChunkList } from "../components/AudioChunkList";
+import { ReviewPanel } from "../components/ReviewPanel";
 import { StoryViewer } from "../components/StoryViewer";
 import { usePolling } from "../hooks/usePolling";
 
@@ -79,6 +80,7 @@ function ProjectBody({ project, client }: { project: ProjectSnapshot; client: Ap
         {gen && <p>Generation: {gen.status}</p>}
         <StoryViewer client={client} story={story} />
       </Section>
+      <ReviewPanel project={project} storyHref={story?.content_path ? client.artifactUrl(story.content_path) : undefined} />
       <Section title="TTS">
         {tts ? (
           <p>Voice: {tts.voice}; engine: {tts.engine}; status: {tts.status}; chunks: {tts.chunk_count ?? "-"}</p>
