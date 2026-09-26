@@ -66,6 +66,7 @@ from .models import (
     PipelineJob,
     RunnerInstance,
     RunnerState,
+    SourceFeed,
     SourceSnapshot,
     StoryGeneration,
     StoryProject,
@@ -86,7 +87,7 @@ BUSINESS, INFRASTRUCTURE, CAPACITY, PROVIDER, UNKNOWN = (
 
 _CATEGORY_CODES = {
     BUSINESS: {"task_failed", "invalid_output", "invalid_canon", "invalid_story", "missing_output",
-               "partial_failure", "chunks_missing", "empty_source", "source_not_configured",
+               "partial_failure", "chunks_missing", "empty_source", "source_not_configured", "inbox_file_missing",
                "project_not_found", "job_failed", "missing_input", "bad_output_path", "unknown_step"},
     INFRASTRUCTURE: {"infra_exhausted", "lease_expired", "runner_crashed", "timeout",
                      "transient_failure", "rate_limited", "quota_exhausted", "auth_error"},
@@ -322,6 +323,25 @@ class ProjectSnapshot:
     status_detail: dict | None = None
     source_attempts: int = 0
     next_attempt_at: datetime | None = None
+    video_id: str | None = None      # ledger key (which YouTube video this project is about)
+    feed_id: str | None = None       # channel / playlist feed it came from, if any
+
+
+@dataclass(frozen=True)
+class FeedSnapshot:
+    id: str
+    kind: str                        # channel | playlist
+    ref: str                         # canonical channel URL | playlist id
+    title: str | None
+    limit_count: int | None          # newest N videos per scan (None = all)
+    languages: list | None
+    status: str                      # active | error
+    known_count: int                 # projects created from this feed so far (the scan cursor)
+    project_count: int
+    skipped: int
+    needs_attention: int
+    last_scanned_at: datetime | None
+    last_error: str | None
 
 
 @dataclass(frozen=True)
@@ -614,6 +634,27 @@ class ReadModels:
                 session_id=wf.workflow_session_id, created_at=wf.created_at, updated_at=wf.updated_at,
                 finished_at=wf.finished_at, projects=snaps, runners=runners, capacity=capacity)
 
+    def list_feeds(self, workflow_id: str) -> list[FeedSnapshot]:
+        """Channels / playlists expanded into this workflow, with how many of their projects ended early."""
+        with self.ctx.session_factory() as db:
+            if db.scalar(select(ChannelWorkflow.id).where(ChannelWorkflow.id == workflow_id)) is None:
+                raise NotFound("workflow not found", workflow_id=workflow_id)
+            feeds = db.scalars(select(SourceFeed).where(SourceFeed.channel_workflow_id == workflow_id)
+                               .order_by(SourceFeed.created_at, SourceFeed.id), **_FRESH).all()
+            tally: dict[str, dict[str, int]] = {}
+            for feed_id, status, n in db.execute(
+                    select(StoryProject.feed_id, StoryProject.status, func.count())
+                    .where(StoryProject.channel_workflow_id == workflow_id, StoryProject.feed_id.is_not(None))
+                    .group_by(StoryProject.feed_id, StoryProject.status)).all():
+                tally.setdefault(feed_id, {})[status] = n
+            return [FeedSnapshot(
+                id=f.id, kind=f.kind, ref=f.ref, title=f.title, limit_count=f.limit_count,
+                languages=list(f.languages) if f.languages else None, status=f.status,
+                known_count=f.known_count or 0, project_count=sum(tally.get(f.id, {}).values()),
+                skipped=tally.get(f.id, {}).get(ProjectStatus.SKIPPED.value, 0),
+                needs_attention=tally.get(f.id, {}).get(ProjectStatus.NEEDS_ATTENTION.value, 0),
+                last_scanned_at=f.last_scanned_at, last_error=_bound(f.last_error)) for f in feeds]
+
     def get_project(self, project_id: str) -> ProjectSnapshot:
         now = self.ctx.clock()
         with self.ctx.session_factory() as db:
@@ -755,7 +796,8 @@ class ReadModels:
             canon=canon, story_generation=gen, story_version=story_version, tts=tts_info, audio=audio_info,
             block=block, failure=failure, status_reason=project.status_reason,
             status_detail=dict(project.status_detail) if project.status_detail else None,
-            source_attempts=project.source_attempts or 0, next_attempt_at=project.next_attempt_at)
+            source_attempts=project.source_attempts or 0, next_attempt_at=project.next_attempt_at,
+            video_id=project.video_id, feed_id=project.feed_id)
 
     @staticmethod
     def _state(current, cur_view, block, failure) -> str:

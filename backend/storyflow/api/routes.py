@@ -1,7 +1,7 @@
 """HTTP routes (prefix ``/api`` is applied by ``create_app``).
 
-Handlers are plain ``def`` (run in the threadpool) and only call ``WorkflowService`` / ``RunnerService``
-(mutations) or ``ReadModels`` (queries) through ``request.app.state.container``. The one exception is
+Handlers are plain ``def`` (run in the threadpool) and only call ``WorkflowService`` / ``RunnerService`` /
+``SourceService`` (mutations) or ``ReadModels`` (queries) through ``request.app.state.container``. The one exception is
 ``/health``, which runs two read-only statements (``SELECT 1`` and ``alembic_version``). Nothing here
 touches ORM rows, the queue, the dispatcher or runners, and runners are never assigned implicitly.
 """
@@ -15,7 +15,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..readmodels import to_jsonable
-from .schemas import AddProjectBody, AssignRunnerBody, CreateWorkflowBody, PathId, QueryId, RetryBody
+from .schemas import (
+    AddProjectBody, AddSourcesBody, AssignRunnerBody, CreateWorkflowBody, PathId, QueryId, RetryBody,
+)
 
 VERSION = "0.6.0"
 router = APIRouter()
@@ -165,6 +167,29 @@ def add_project(request: Request, response: Response, workflow_id: PathId, body:
     result = c.workflows.add_project(workflow_id, body.title, slug=body.slug, description=body.description)
     response.status_code = 201 if result.changed else 200
     return {"result": to_jsonable(result), "project": to_jsonable(c.read.get_project(result.detail["project_id"]))}
+
+
+@router.post("/workflows/{workflow_id}/sources")
+def add_sources(request: Request, response: Response, workflow_id: PathId, body: AddSourcesBody):
+    """Expand videos / playlists / channels into projects of this workflow (each video is processed once)."""
+    c = _c(request)
+    result = c.sources.add_sources(workflow_id, body.sources, limit=body.limit, languages=body.languages,
+                                   reprocess=body.reprocess, min_duration_seconds=body.min_duration_seconds)
+    response.status_code = 201 if result.changed else 200
+    return {"result": to_jsonable(result), "workflow": to_jsonable(c.read.get_workflow(workflow_id))}
+
+
+@router.post("/workflows/{workflow_id}/sync")
+def sync_sources(request: Request, workflow_id: PathId):
+    """Re-scan the workflow's channels / playlists and add only videos not seen before."""
+    c = _c(request)
+    result = c.sources.sync_feeds(workflow_id)
+    return {"result": to_jsonable(result), "workflow": to_jsonable(c.read.get_workflow(workflow_id))}
+
+
+@router.get("/workflows/{workflow_id}/feeds")
+def list_feeds(request: Request, workflow_id: PathId):
+    return {"feeds": to_jsonable(_c(request).read.list_feeds(workflow_id))}
 
 
 @router.get("/projects/{project_id}")

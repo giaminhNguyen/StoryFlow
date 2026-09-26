@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / "backend" / ".env"
 VENV_PY = ROOT / "backend" / ".venv" / "Scripts" / "python.exe"
 SUBTITLE_REQ = ROOT / "backend" / "requirements-subtitle.txt"
+CHANNEL_REQ = ROOT / "backend" / "requirements-channel.txt"
 YES = "--yes" in sys.argv
 
 for stream in (sys.stdout, sys.stdin):
@@ -58,7 +59,7 @@ def heading(text: str) -> None:
 
 
 def configure_subtitles(env: dict[str, str]) -> None:
-    heading("1/3  Phụ đề YouTube")
+    heading("1/4  Phụ đề YouTube")
     print("  Lấy phụ đề thật từ YouTube (thư viện youtube-transcript-api).")
     if not ask_yes("Bật lấy phụ đề thật?"):
         env["STORYFLOW_SUBTITLE_PROVIDER"] = "none"
@@ -73,11 +74,28 @@ def configure_subtitles(env: dict[str, str]) -> None:
     print("  OK")
 
 
+# ---------------------------------------------------------------------------- channels
+
+
+def configure_channels(env: dict[str, str]) -> None:
+    heading("4/4  Link channel / playlist YouTube")
+    print("  Cho phép dán link CHANNEL hoặc PLAYLIST để tự lấy danh sách video (dùng yt-dlp, không cần API key).")
+    print("  Link 1 video lẻ thì luôn dùng được, không cần bước này.")
+    if not ask_yes("Bật link channel / playlist?"):
+        return
+    print("  Đang cài yt-dlp...")
+    rc = subprocess.call([str(VENV_PY), "-m", "pip", "install", "-q", "-r", str(CHANNEL_REQ)])
+    if rc != 0:
+        print("  ! Cài yt-dlp thất bại (kiểm tra mạng). Link channel tạm không dùng được; chạy lại setup để thử lại.")
+        return
+    print("  OK")
+
+
 # ---------------------------------------------------------------------------- story
 
 
 def configure_story(env: dict[str, str]) -> None:
-    heading("2/3  Viết truyện bằng Claude")
+    heading("2/4  Viết truyện bằng Claude")
     print("  Dùng công cụ `claude` (Claude Code) trên máy bạn; tốn usage của tài khoản Claude của bạn.")
     found = shutil.which("claude")
     if found:
@@ -136,7 +154,7 @@ def _list_voices(py: Path) -> list[str]:
 
 
 def configure_tts(env: dict[str, str]) -> None:
-    heading("3/3  Đọc truyện thành audio (VieNeu-TTS)")
+    heading("3/4  Đọc truyện thành audio (VieNeu-TTS)")
     print("  Cần bản VieNeu-TTS cài sẵn trên máy (thư mục có .venv riêng).")
     root = next((c for c in _vieneu_candidates() if _vieneu_python(c).is_file()), None)
     if root:
@@ -218,6 +236,7 @@ def main() -> int:
     configure_subtitles(env)
     configure_story(env)
     configure_tts(env)
+    configure_channels(env)
     write_env(env)
     print(f"\nĐã ghi {ENV_FILE}")
     return 0

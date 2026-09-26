@@ -41,6 +41,7 @@ Real providers are opt-in (`backend\.env`, see `backend\.env.example`); fakes ar
 | Capability | Default | Real option | Requirement |
 |---|---|---|---|
 | Subtitles | external (pinned Subtitle_supperVip subprocess) | `STORYFLOW_SUBTITLE_PROVIDER=external` | `pip install -r backend\requirements-subtitle.txt` |
+| Channel / playlist links | off (single video links always work) | `yt-dlp`, no API key | `pip install -r backend\requirements-channel.txt` (`setup.bat` offers it) |
 | Story / canon | none | `STORYFLOW_STORY_RUNNER=claude-cli` | `claude` CLI installed and logged in |
 | TTS | none | `STORYFLOW_TTS_ENGINE=vieneu`, `STORYFLOW_VIENEU_ROOT` | local VieNeu-TTS checkout |
 
@@ -83,6 +84,7 @@ Current migration head:
 → 0004_pipeline_dedupe
 → 0005_control_plane
 → 0006_source_policy
+→ 0007_source_feeds
 ```
 
 ### Post-MVP roadmap progress (batch operation)
@@ -91,7 +93,7 @@ Current migration head:
 |---|---|
 | P0 story length >= source, single `final.wav`, one-click setup | done |
 | P1 failure policy: subtitle backoff/retry limit, `skipped` / `needs_attention` projects, batch keeps going (migration `0006`) | done - see `docs/OPERATIONS.md` "Failure policy" |
-| P2 channel / playlist / video-list input, processed-video ledger | planned |
+| P2 channel / playlist / video-list / local-file input, processed-video ledger, sync of new videos, subtitle inbox (migration `0007`, `POST /api/workflows/{id}/sources`, `/sync`, `GET .../feeds`) | done - see `docs/OPERATIONS.md` "Adding videos, playlists and channels" |
 | P3 batch orchestration (bounded overlap, retry a skipped project) | planned |
 | P4 review + revision, presets (Fast / Balanced / Quality) | planned |
 

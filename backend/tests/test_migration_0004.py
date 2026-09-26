@@ -40,7 +40,8 @@ def test_chain_is_linear_and_0004_follows_0003():
     assert rev.down_revision == "0003_story_domain"
     assert script.get_revision("0005_control_plane").down_revision == "0004_pipeline_dedupe"
     assert script.get_revision("0006_source_policy").down_revision == "0005_control_plane"
-    assert script.get_heads() == ["0006_source_policy"]
+    assert script.get_revision("0007_source_feeds").down_revision == "0006_source_policy"
+    assert script.get_heads() == ["0007_source_feeds"]
 
 
 def test_clean_upgrade_downgrade_upgrade(monkeypatch, tmp_path):

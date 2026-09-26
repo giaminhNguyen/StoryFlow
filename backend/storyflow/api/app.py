@@ -27,6 +27,7 @@ from ..artifacts import ArtifactStore
 from ..readmodels import ReadModels
 from ..runtime.app import RuntimeApp
 from ..services import RunnerService, WorkflowService
+from ..source_service import SourceService
 from . import artifacts
 from .errors import error_response, register_error_handlers
 from .host import RuntimeHost
@@ -46,6 +47,7 @@ class Container:
     store: ArtifactStore
     runtime_app: RuntimeApp
     host: RuntimeHost | None
+    sources: SourceService | None = None
 
 
 def _host_of(header_value: str) -> str:
@@ -219,7 +221,7 @@ def create_app(app: RuntimeApp, *, run_runtime: bool = False, cors_origins=None,
         workflows=WorkflowService(app.ctx, app.orchestrator),
         runners=RunnerService(app.session_factory, app.ctx.clock),
         read=ReadModels(app.ctx, app.orchestrator.chain),
-        store=app.store, runtime_app=app, host=host)
+        store=app.store, runtime_app=app, host=host, sources=SourceService(app.ctx))
     register_error_handlers(api)
     api.add_middleware(CORSMiddleware, allow_origins=list(cors_origins or []),
                        allow_origin_regex=LOOPBACK_ORIGIN_REGEX, allow_methods=["GET", "POST"],

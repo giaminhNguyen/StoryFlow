@@ -28,6 +28,11 @@ provider, so no text leaves the machine and no model runs unless the operator op
     STORYFLOW_VIENEU_VOICE        default preset voice               (default "Ngọc Huyền")
     STORYFLOW_TTS_TIMEOUT         seconds per audio run              (default 1800)
 
+    STORYFLOW_YTDLP_PYTHON        interpreter that has ``yt-dlp`` (channel / playlist listing)   (default: this one)
+    STORYFLOW_LISTER_TIMEOUT      seconds per channel / playlist listing                        (default 120)
+    STORYFLOW_INBOX_DIR           folder for subtitle files you provide yourself (<video_id>.txt/.srt/.vtt or
+                                  ``inbox:name.txt`` sources)                                   (default runtime/inbox)
+
 Credentials are owned by the external tools (the ``claude`` CLI's own login); StoryFlow never reads,
 stores or logs them, and ``ProviderStatus`` carries only a state + a short, path-free message.
 """
@@ -89,6 +94,10 @@ class ProviderConfig:
     vieneu_voice: str = "Ngọc Huyền"
     tts_timeout: float = 1800.0
 
+    ytdlp_python: str = field(default_factory=lambda: sys.executable)
+    lister_timeout: float = 120.0
+    inbox_dir: str | None = None
+
     def problems(self) -> list[str]:
         """Invalid values (reported as MISCONFIGURED; never raised so the app still starts)."""
         out = []
@@ -100,7 +109,7 @@ class ProviderConfig:
             out.append(f"STORYFLOW_TTS_ENGINE must be one of {TTS_ENGINES}")
         if self.vieneu_precision not in ("fp32", "int8"):
             out.append("STORYFLOW_VIENEU_PRECISION must be fp32 or int8")
-        for name in ("subtitle_timeout", "story_timeout", "tts_timeout"):
+        for name in ("subtitle_timeout", "story_timeout", "tts_timeout", "lister_timeout"):
             if getattr(self, name) <= 0:
                 out.append(f"{name} must be > 0")
         if self.vieneu_threads < 1:
@@ -110,6 +119,10 @@ class ProviderConfig:
     def resolved_subtitle_backend_dir(self) -> Path:
         return Path(self.subtitle_backend_dir) if self.subtitle_backend_dir else (
             PROJECT_ROOT / "external" / "subtitle_suppervip" / "backend")
+
+    def resolved_inbox_dir(self) -> Path:
+        from .config import RUNTIME_DIR
+        return Path(self.inbox_dir) if self.inbox_dir else RUNTIME_DIR / "inbox"
 
     def resolved_claude_cli(self) -> str | None:
         """Configured path/name, else whatever is on PATH; None when not found."""
@@ -188,6 +201,9 @@ def load_provider_config(env: dict | None = None, env_files: list[Path] | None =
         vieneu_threads=number("VIENEU_THREADS", defaults.vieneu_threads, int),
         vieneu_voice=get("VIENEU_VOICE", defaults.vieneu_voice),
         tts_timeout=number("TTS_TIMEOUT", defaults.tts_timeout, float),
+        ytdlp_python=get("YTDLP_PYTHON", defaults.ytdlp_python),
+        lister_timeout=number("LISTER_TIMEOUT", defaults.lister_timeout, float),
+        inbox_dir=get("INBOX_DIR"),
     )
 
 
@@ -203,6 +219,7 @@ class ProviderStack:
     subtitle_client: object
     runner_providers: list
     _status_fns: list = field(default_factory=list)
+    video_lister: object | None = None      # storyflow.sources.VideoLister (channel / playlist expansion)
 
     def statuses(self) -> list[ProviderStatus]:
         return [fn() for fn in self._status_fns]
@@ -228,8 +245,11 @@ def build_provider_stack(config: ProviderConfig, store) -> ProviderStack:
     from .subtitles import ProviderUnavailable, SubtitleClient
     from .tts_steps import FakeAudioRunner, FakeTTSAdapterRunner
 
+    from .sources import YtDlpLister
+
     problems = config.problems()
-    stack = ProviderStack(config=config, subtitle_client=None, runner_providers=[])
+    stack = ProviderStack(config=config, subtitle_client=None, runner_providers=[],
+                          video_lister=YtDlpLister(config.ytdlp_python, config.lister_timeout))
 
     def bad(kind, name, text):
         return ProviderStatus(name, kind, MISCONFIGURED, text)

@@ -1,0 +1,5 @@
+# OPTIONAL: lets StoryFlow expand a YouTube channel / playlist link into its videos (no API key needed).
+# Single video links work without it. Installed into the interpreter named by STORYFLOW_YTDLP_PYTHON
+# (default: the StoryFlow venv):
+#     backend\.venv\Scripts\python -m pip install -r backend\requirements-channel.txt
+yt-dlp==2026.8.19

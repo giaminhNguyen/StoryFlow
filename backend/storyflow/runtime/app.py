@@ -225,7 +225,9 @@ def build_runtime(*, database_url: str | None = None, artifact_root=None,
             subtitle_client = stack.subtitle_client
         if providers is None:
             providers = stack.runner_providers
-    ctx = PipelineContext(session_factory=session_factory, store=store, subtitle_client=subtitle_client, clock=clock)
+    ctx = PipelineContext(session_factory=session_factory, store=store, subtitle_client=subtitle_client, clock=clock,
+                          video_lister=getattr(stack, "video_lister", None),
+                          inbox_dir=stack.config.resolved_inbox_dir() if stack is not None else None)
     registry = RunnerRegistry()
     dispatcher = Dispatcher(registry)
     orchestrator = Orchestrator(ctx, dispatcher, SourceStep(), [CanonStep(), StoryStep(), TTSStep(), AudioStep()])

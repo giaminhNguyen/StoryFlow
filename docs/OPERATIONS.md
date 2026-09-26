@@ -67,6 +67,35 @@ Provider states: `ready`, `unavailable` (a dependency is missing; the message sa
 
 Other variables: `STORYFLOW_LOG_LEVEL` (default `info`), `STORYFLOW_LOG_DIR`.
 
+### Adding videos, playlists and channels (batches)
+
+One workflow can hold many videos. Send sources to `POST /api/workflows/{id}/sources`:
+
+```json
+{"sources": ["https://www.youtube.com/@channel", "https://youtu.be/VIDEO_ID", "inbox:my-story.txt"],
+ "limit": 10, "languages": ["vi"], "reprocess": false, "min_duration_seconds": 300}
+```
+
+| Source | Result |
+|---|---|
+| video link / bare 11-char id (`watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`) | one project |
+| playlist (`playlist?list=`) or channel (`/@handle`, `/channel/UC...`, `/c/name`, `/user/name`) | the **newest `limit` videos** (default 10, max 1000), newest first; the feed is remembered |
+| `inbox:file.txt` | one project read from a subtitle file you put in `runtime\inbox\` (`.txt`, `.srt`, `.vtt`) |
+
+* **Every video is processed once (ledger).** A video that already has a project in this workflow, or in any
+  workflow that was not cancelled, is reported under `duplicates` (`in_workflow`, `already_processed`, `repeated`) and
+  not added again. Send `"reprocess": true` to add it anyway.
+* `POST /api/workflows/{id}/sync` re-scans the stored channels / playlists and adds only videos not seen before
+  (`known_count` and `last_scanned_at` are the cursor); `GET /api/workflows/{id}/feeds` lists them. Adding to a
+  finished workflow re-opens it. A feed that cannot be listed is marked `error` and the other feeds still sync.
+* Channel / playlist links need `yt-dlp` (`backend\requirements-channel.txt`, installed by `setup.bat`; no API key).
+  Video links and inbox files work without it. Settings: `STORYFLOW_YTDLP_PYTHON`, `STORYFLOW_LISTER_TIMEOUT`.
+* **Inbox** (`STORYFLOW_INBOX_DIR`, default `runtime\inbox`): a file named `<video_id>.txt|srt|vtt` is used instead of
+  asking YouTube (handy when YouTube blocks your IP or a video has no subtitles); `inbox:name.txt` adds a project from
+  a file that has no video at all. Only plain file names inside that folder are ever read.
+* Videos are picked up in listing order. For a batch use `"failure_policy": {"on_no_subtitle": "skip",
+  "on_permanent_error": "continue"}` (below) so one bad video does not stop the rest.
+
 ### Failure policy (subtitles and batches)
 
 `failure_policy` in the workflow config decides what happens when ONE video fails. New workflows get

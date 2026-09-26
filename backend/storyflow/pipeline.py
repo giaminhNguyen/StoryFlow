@@ -92,6 +92,9 @@ class PipelineContext:
     store: ArtifactStore
     subtitle_client: SubtitleClient
     clock: Callable[[], datetime]
+    # Optional collaborators of multi-source ingestion (roadmap 4.1); None = feature off.
+    video_lister: object | None = None      # storyflow.sources.VideoLister (channel / playlist expansion)
+    inbox_dir: object | None = None         # Path: operator-provided subtitle files (<video_id>.txt / .srt / .vtt)
 
 
 class StepHandler(abc.ABC):
@@ -201,6 +204,8 @@ def workflow_config(db, project: StoryProject) -> dict:
       {"source": {"video_id": str, "languages": [str], "preference": "any", "allow_translation": true},
        "story":  {"branch": str|null, "direction": str|null, "target_length": int|null},
        "tts":    {"voice": str, "engine": str, "profile": str}}
+    A project's own ``source_config`` (video_id, languages, ...) overrides the ``source`` block, so one workflow
+    can hold many videos (see storyflow/sources.py and WorkflowService.add_sources).
     """
     wf = workflow_for_project(db, project)
     return dict(wf.config or {}) if wf is not None else {}

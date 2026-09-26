@@ -75,14 +75,17 @@ from .pipeline import (
     workflow_config,
 )
 from .policy import FailurePolicy, classify_source_error, policy_from_config, terminal_status_for
+from .sources import find_inbox_file, read_inbox_text
 from .protocol import ResultCode, RunnerResult, TaskPacket
 from .roles import Role
 from .subtitles import (
     PROJECT_ROOT,
     BlockedByProvider,
+    FetchedSubtitle,
     LanguageUnavailable,
     ProviderTimeout,
     ProviderUnavailable,
+    SubtitleSnippet,
     SubtitlesUnavailable,
     plain_text,
 )
@@ -284,6 +287,7 @@ class SourceStep(InlineStepHandler):
                 return StepView(StepStatus.COMPLETED, domain_id=existing.id)
             wf_config = workflow_config(db, project)
             cfg = dict(wf_config.get("source") or {})
+            cfg.update(project.source_config or {})          # the project's own source wins over the workflow's
             policy = policy_from_config(wf_config)
             title = project.title
             if project.status in TERMINAL_PROJECT_STATUSES:  # already skipped / needs attention
@@ -293,13 +297,31 @@ class SourceStep(InlineStepHandler):
                 last = (project.status_detail or {}).get("last_error") or "provider_blocked"
                 return StepView(StepStatus.NOT_STARTED, error_code=last)
         video_id = cfg.get("video_id")
-        if not video_id:
+        inbox_name = None
+        if cfg.get("kind") == "local":                      # a subtitle file dropped in the inbox
+            inbox_name = cfg.get("file")
+            if not inbox_name or read_inbox_text(ctx.inbox_dir, inbox_name) is None:
+                return self._failed(ctx, project_id, "inbox_file_missing", policy)
+            video_id = video_id or None
+        elif not video_id:
             return self._failed(ctx, project_id, "source_not_configured", policy)
+        else:                                               # an explicit <video_id>.txt/.srt/.vtt beats the provider
+            inbox_name = find_inbox_file(ctx.inbox_dir, video_id)
+        fetched = None
+        if inbox_name is not None:
+            text = read_inbox_text(ctx.inbox_dir, inbox_name)
+            if text is not None:
+                fetched = FetchedSubtitle(
+                    language="Local file", language_code="und", is_generated=False, is_translatable=False,
+                    translated=False, snippets=[SubtitleSnippet(line, 0.0, 0.0) for line in text.splitlines()])
+            else:
+                inbox_name = None   # unreadable file: use the provider and do not label the snapshot as inbox
 
         try:  # no DB transaction is open here
-            fetched = ctx.subtitle_client.fetch(
-                video_id, cfg.get("languages"), cfg.get("preference", "any"),
-                cfg.get("allow_translation", True))
+            if fetched is None:
+                fetched = ctx.subtitle_client.fetch(
+                    video_id, cfg.get("languages"), cfg.get("preference", "any"),
+                    cfg.get("allow_translation", True))
         except SubtitlesUnavailable:
             return self._failed(ctx, project_id, "subtitles_unavailable", policy)
         except LanguageUnavailable:
@@ -334,8 +356,11 @@ class SourceStep(InlineStepHandler):
                 "video_id": video_id, "language": fetched.language,
                 "language_code": fetched.language_code, "is_generated": fetched.is_generated,
                 "translated": fetched.translated,
-                "provider": type(ctx.subtitle_client).__name__, "artifact_path": rel,
+                "provider": "InboxFile" if inbox_name else type(ctx.subtitle_client).__name__,
+                "artifact_path": rel,
             }
+            if inbox_name:
+                meta["inbox_file"] = inbox_name
             snap = self._insert_snapshot(ctx, project_id, number, title, content, content_hash, meta)
             if snap is not None:
                 self._clear_backoff(ctx, project_id)

@@ -170,7 +170,19 @@ def _provider_checks(env: dict | None, artifact_root: Path) -> list[Check]:
             out.append(Check(name, WARN, f"{text} ({st.state})", "Fix the STORYFLOW_* configuration for this provider."))
         else:
             out.append(Check(name, INFO, f"{text} ({st.state})"))
+    out.append(_lister_check(config))
     return out
+
+
+def _lister_check(config) -> Check:
+    """Channel / playlist links need yt-dlp (optional: single video links work without it)."""
+    name = "provider:lister"
+    if config.ytdlp_python != sys.executable:
+        return Check(name, INFO, "yt-dlp interpreter is set by STORYFLOW_YTDLP_PYTHON (not probed)")
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return Check(name, PASS, "yt-dlp: available (channel / playlist links)")
+    return Check(name, INFO, "yt-dlp is not installed: channel / playlist links are unavailable (video links still work)",
+                 "Optional: pip install -r backend/requirements-channel.txt")
 
 
 def run_doctor(*, db_path: Path | str | None = None, artifact_root: Path | str | None = None,

@@ -269,6 +269,7 @@ class StoryProject(Base):
     __table_args__ = (
         Index("uq_story_projects_slug", "slug", unique=True),
         Index("ix_story_projects_channel_workflow_id", "channel_workflow_id"),
+        Index("ix_story_projects_video_id", "video_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -282,6 +283,36 @@ class StoryProject(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Phase 4.1 (0007): which video this project is about (ledger / dedupe), where it came from, and its own
+    # source settings (override the workflow-level ``source`` block): {"kind": "video"|"local", "video_id"|"file", ...}
+    video_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    feed_id: Mapped[str | None] = mapped_column(String(36), nullable=True)   # soft reference to source_feeds.id
+    source_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SourceFeed(Base):
+    """A channel or playlist that was expanded into projects (roadmap 4.1). ``known_count`` and
+    ``last_scanned_at`` are the cursor: a re-scan only adds videos the ledger has not seen."""
+
+    __tablename__ = "source_feeds"
+    __table_args__ = (
+        Index("ix_source_feeds_channel_workflow_id", "channel_workflow_id"),
+        Index("uq_source_feeds_ref", "channel_workflow_id", "kind", "ref", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    channel_workflow_id: Mapped[str] = mapped_column(ForeignKey("channel_workflows.id"))
+    kind: Mapped[str] = mapped_column(String(16))            # channel | playlist
+    ref: Mapped[str] = mapped_column(String(512))            # canonical channel URL | playlist id
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    limit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)   # newest N per scan (None = all)
+    languages: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active")         # active | error
+    known_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
